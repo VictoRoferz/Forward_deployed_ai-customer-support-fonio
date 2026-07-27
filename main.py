@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 from enum import Enum
 
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from conn_business_central import (
@@ -33,6 +34,7 @@ from conn_business_central import (
     lookup_by_name_all,
     lookup_by_phone,
     phone_matches,
+    probe_contact,
     warmup,
 )
 from conn_zammad import (
@@ -43,7 +45,12 @@ from conn_zammad import (
     search_open_tickets,
 )
 from conn_zammad import warmup as zammad_warmup
-from verification import classify_item, match_identity_factors
+from verification import (
+    classify_item,
+    first_name_matches,
+    match_identity_factors,
+    normalize_dob,
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("fonio-bc")
@@ -69,6 +76,12 @@ SPARE_MAX_QUANTITY = int(os.environ.get("SPARE_MAX_QUANTITY", "5"))
 # Zammad priority for VIGILANCE / URGENT_MEDICAL tickets.
 # Confirmed live on medelde1: 1 low / 2 normal / 3 high.
 ZAMMAD_URGENT_PRIORITY_ID = int(os.environ.get("ZAMMAD_URGENT_PRIORITY_ID", "3"))
+
+# Enforce the spoken Vorname against BC's stored firstName on name-path
+# verification (§10 policy: Vorname UND Nachname + Geburtsdatum). Set to 0 if
+# STT proves too unreliable on first names in practice (nicknames like "Sepp"
+# for Josef already fail closed and fall back to the Kundennummer path).
+STRICT_FIRSTNAME = os.environ.get("STRICT_FIRSTNAME", "1") == "1"
 
 
 def _check_auth(authorization: str | None) -> None:
@@ -231,7 +244,11 @@ class VerifyOut(BaseModel):
 
 
 class CallLogIn(_TemplateTolerantModel):
-    """Fonio post-processing (after-call) payload → one Zammad ticket."""
+    """Fonio post-processing (after-call) payload → ONE Zammad ticket carrying
+    the whole call protocol (decision 2026-07-27): verification outcome, the
+    request tickets filed mid-call, what was asked for, and the eligibility
+    result. All fields Optional (the _TemplateTolerantModel rule — unfilled
+    Fonio variables arrive as "" / "{{var}}" and must not 422)."""
 
     phone_number: str | None = Field(default=None, description="Caller's number")
     name: str | None = Field(default=None, description="Caller/contact name, if known")
@@ -242,6 +259,20 @@ class CallLogIn(_TemplateTolerantModel):
     contact_no: str | None = Field(default=None, description="BC contact no. (KN-number), if matched")
     bc_found: bool | None = Field(default=None, description="Whether BC identified the caller")
     title: str | None = Field(default=None, description="Override the ticket title")
+    verified: bool | None = Field(
+        default=None, description="Outcome of /verify-caller during the call"
+    )
+    request_numbers: str | None = Field(
+        default=None,
+        description="Zammad ticket numbers of requests filed mid-call (§11.4 readbacks)",
+    )
+    requested_items: str | None = Field(
+        default=None, description="What the caller asked for, agent's words"
+    )
+    eligibility: str | None = Field(
+        default=None, description="{{permission_to_order_again}} echo (true/false)"
+    )
+    internal: bool = Field(default=False, description="Mark the article internal (testing)")
 
 
 class CallLogOut(BaseModel):
@@ -253,6 +284,20 @@ class CallLogOut(BaseModel):
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/health/deep")
+def health_deep() -> JSONResponse:
+    """Dependency probe for external monitoring (the alerting mechanism —
+    decision 2026-07-27: no in-server alert task; point e.g. UptimeRobot here).
+    Checks that BC's Contact entity actually answers a query (auth alone missed
+    the 2026-07-27 unpublished-web-services outage) and that Zammad responds.
+    200 iff both are up, else 503. Unauthenticated like /health — exposes only
+    ok/fail, no data."""
+    bc_ok = probe_contact()
+    zammad_ok = zammad_warmup()
+    body = {"bc": "ok" if bc_ok else "fail", "zammad": "ok" if zammad_ok else "fail"}
+    return JSONResponse(status_code=200 if bc_ok and zammad_ok else 503, content=body)
 
 
 @app.post("/lookup-caller", response_model=CallerOut)
@@ -269,11 +314,15 @@ def lookup_caller(
         contact = lookup_by_phone(body.phone_number)
     except BCConfigError as e:
         raise HTTPException(status_code=500, detail=f"config: {e}") from e
-    except BCAuthError as e:
-        raise HTTPException(status_code=502, detail=f"bc auth: {e}") from e
-    except Exception as e:
-        log.exception("lookup_by_phone failed")
-        raise HTTPException(status_code=502, detail=str(e)) from e
+    except Exception:
+        # Graceful degrade (incl. BCAuthError): a 5xx here makes Fonio drop the
+        # webhook and start the call with NO context at all, so any BC failure
+        # (e.g. the 2026-07-27 unpublished-web-services outage) becomes an
+        # "unknown caller" instead — the agent falls back to name/Kundennummer
+        # verification, which fails loudly (502) on its own if BC is down.
+        # Detection lives in warmup()/GET /health/deep, not in dropped calls.
+        log.exception("lookup_by_phone failed; degrading to customer_found=false")
+        return CallerOut(customer_found=False, phone_number=body.phone_number)
 
     if not contact:
         return CallerOut(customer_found=False, phone_number=body.phone_number)
@@ -336,10 +385,14 @@ def lookup_name(
     return ContactOut(found=True, candidates=matches)
 
 
+# Uniform §10.1 failure text: byte-identical for "no record", "wrong factor"
+# AND "ambiguous" (never reveal which), and it always names the Kundennummer
+# FIRST as the next step (decision 2026-07-27) — e.g. two patients sharing
+# name + Geburtsdatum can only be told apart by their Kundennummer.
 _VERIFY_FAIL_MSG = (
-    "Die Identität konnte nicht sicher bestätigt werden. Es kann ein "
-    "Rückrufwunsch erfasst werden, oder fragen Sie nach Kundennummer "
-    "oder Postleitzahl und versuchen Sie es noch einmal."
+    "Die Identität konnte nicht sicher bestätigt werden. Bitte fragen Sie "
+    "nach der Kundennummer und versuchen Sie es damit noch einmal — "
+    "alternativ kann ein Rückrufwunsch erfasst werden."
 )
 
 
@@ -372,9 +425,19 @@ def _resolve_and_verify(
     caller-facing response must be identical either way (§10.1).
     BC transport/auth errors propagate — callers map them to HTTP codes.
     """
+    # Normalized ONCE: goes into the BC $filter (so the right patient is in the
+    # candidate pool even for 618 Müllers — the top-N truncation bug of
+    # 2026-07-27) and is re-checked per candidate by match_identity_factors.
+    dob_iso = normalize_dob(date_of_birth)
+
     def evaluate(pool: list[dict]) -> list[tuple[dict, list[str]]]:
         found = []
         for c in pool:
+            # Name-selected pools only (ring/Kundennummer paths bypass this):
+            # the spoken Vorname must fit BC's stored Vornamen (§10 policy) —
+            # surname+DOB alone must not verify as somebody else.
+            if STRICT_FIRSTNAME and not first_name_matches(name, c.get("first_name")):
+                continue
             _, matched = match_identity_factors(
                 c,
                 date_of_birth=date_of_birth,
@@ -387,7 +450,7 @@ def _resolve_and_verify(
                 found.append((c, matched))
         return found
 
-    candidates = lookup_by_name(name, limit=10) if name else []
+    candidates = lookup_by_name(name, limit=10, birth_date_iso=dob_iso) if name else []
     survivors = evaluate(candidates)
     evaluated_nos = {c.get("no") for c in candidates}
 
@@ -396,7 +459,7 @@ def _resolve_and_verify(
         # rows, which loses e.g. "Haußmann" when STT wrote "Hausmann" and
         # literal Hausmanns exist. Merge ALL spelling variants and re-check.
         try:
-            widened = [c for c in lookup_by_name_all(name, limit=10)
+            widened = [c for c in lookup_by_name_all(name, limit=10, birth_date_iso=dob_iso)
                        if c.get("no") not in evaluated_nos]
         except Exception:
             log.exception("widened name search failed; keeping first-pass result")
@@ -769,6 +832,19 @@ def log_call(
     runs after the call — no 5000 ms budget. Not on the live-call critical path.
     """
     _check_auth(authorization)
+    # Full protocol lines (decision 2026-07-27) — the human sees the whole call
+    # in one ticket and can cross-open the request tickets by number. This is
+    # also the backstop for the accepted same-call duplicate-lag risk: if two
+    # identical requests evaded DUPLICATE_OPEN, both numbers are listed here.
+    # PII rule unchanged: no insurance number, no device serials.
+    extra = {
+        "Identität verifiziert": _verified_label(body.verified),
+        "Angelegte Vorgänge": body.request_numbers,
+        "Angefragte Artikel": body.requested_items,
+        "Bestellberechtigung (90-Tage-Regel)": {
+            "true": "ja", "false": "nein"
+        }.get((body.eligibility or "").strip().lower(), body.eligibility),
+    }
     try:
         ticket = create_call_ticket(
             phone_number=body.phone_number,
@@ -778,6 +854,8 @@ def log_call(
             contact_no=body.contact_no,
             bc_found=body.bc_found,
             title=body.title,
+            extra=extra,
+            internal=body.internal,
         )
     except ZammadConfigError as e:
         raise HTTPException(status_code=500, detail=f"zammad config: {e}") from e

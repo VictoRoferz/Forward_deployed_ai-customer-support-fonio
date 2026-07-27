@@ -151,6 +151,52 @@ def match_identity_factors(
     return verified, matched
 
 
+# --- First-name (Vorname) check ----------------------------------------------
+
+# Salutations/titles STT may prepend to the spoken name — never Vornamen.
+_NAME_PREFIXES = {"herr", "frau", "dr", "prof", "med", "dipl", "ing"}
+
+
+def _fold_name_token(token: str) -> str:
+    """Casefold + fold German special characters so STT variants compare equal
+    ("Jürgen" == "Juergen", "Groß" == "Gross"). Mirrors the spelling-variant
+    idea in conn_business_central._name_variants, kept local so this module
+    stays import-free."""
+    t = token.casefold().replace("ß", "ss")
+    return t.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue")
+
+
+def _name_tokens(raw: str | None) -> list[str]:
+    """Folded tokens, split on whitespace/hyphens ("Hans-Peter" -> hans, peter),
+    stripped of punctuation and salutation/title prefixes."""
+    tokens = [
+        _fold_name_token(t.strip(".,"))
+        for t in re.split(r"[\s\-]+", raw or "")
+        if t.strip(".,")
+    ]
+    return [t for t in tokens if t not in _NAME_PREFIXES]
+
+
+def first_name_matches(spoken_name: str | None, stored_first_name: str | None) -> bool:
+    """Does the caller-spoken Vorname fit BC's stored firstName? (§10 policy:
+    Vorname UND Nachname + Geburtsdatum.)
+
+    Returns True when the check does not apply — the caller spoke fewer than
+    two name tokens (Nachname-only callers stay tolerated) or BC has no
+    firstName on file (surname-only records). Otherwise ANY spoken token must
+    equal ANY stored Vorname token: "Marvin Müller", "Noah Müller" (Rufname is
+    often the second Vorname) and "Müller Marvin" (surname-first speech order)
+    all fit "Marvin Noah", while "Peter Müller" fits none of its tokens and is
+    rejected. Known trade-off: nicknames ("Sepp" for Josef) fail and fall back
+    to the Kundennummer path.
+    """
+    spoken = _name_tokens(spoken_name)
+    stored = _name_tokens(stored_first_name)
+    if len(spoken) < 2 or not stored:
+        return True
+    return any(t in stored for t in spoken)
+
+
 # --- Spare-part item whitelist (§21 compliance rule, deliberately hardcoded) --
 
 _BATTERY_KEYWORDS = ("batter", "akku")            # Batterie(n), battery, Akkus

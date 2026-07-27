@@ -15,6 +15,7 @@ OData endpoint:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import time
@@ -23,6 +24,8 @@ from typing import Any
 
 import requests
 from requests.auth import HTTPBasicAuth
+
+log = logging.getLogger("fonio-bc.connector")
 
 BC_CONTACTS_URL = os.environ.get("BC_CONTACTS_URL", "").rstrip("/")
 
@@ -102,20 +105,46 @@ def _get_oauth_token() -> str:
     return _token_cache["access_token"]
 
 
+def probe_contact() -> bool:
+    """Can the Contact entity actually answer a query? Best-effort, never raises.
+
+    Auth alone is not enough to know BC works: on 2026-07-27 the DE-TEST
+    sandbox lost ALL custom web-service publications (Contact 404'd for hours)
+    while OAuth kept succeeding. This probe is the detection hook — used by
+    warmup() at startup and by GET /health/deep for external monitoring."""
+    try:
+        _odata_get("no ne ''", top=1)
+        return True
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        if status == 404:
+            log.error(
+                "BC Contact probe 404 — web service likely UNPUBLISHED "
+                "(check the service doc at the ODataV4 root): %s", e
+            )
+        else:
+            log.error("BC Contact probe failed (HTTP %s): %s", status, e)
+        return False
+    except Exception as e:
+        log.error("BC Contact probe failed: %s", e)
+        return False
+
+
 def warmup() -> bool:
-    """Pre-fetch the OAuth token at startup so the first Fonio call doesn't pay
-    the ~2.8 s handshake on the critical path (Fonio drops the webhook after
-    5000 ms). Best-effort: returns False (instead of raising) if auth isn't
-    configured or the handshake fails, so startup never crashes on a cold BC.
-    Basic-auth deployments have no token to prefetch, so this is a no-op (True).
+    """Pre-fetch the OAuth token AND probe the Contact entity at startup, so the
+    first Fonio call doesn't pay the ~2.8 s handshake on the critical path
+    (Fonio drops the webhook after 5000 ms) and an unpublished/unreachable
+    Contact web service is visible in the startup log instead of surfacing as
+    silent no-matches during a live call. Best-effort: returns False (never
+    raises) if auth is unconfigured, the handshake fails, or the probe fails.
     """
     if not (BC_TENANT_ID and BC_CLIENT_ID and BC_CLIENT_SECRET):
         return False
     try:
         _get_oauth_token()
-        return True
     except (BCConfigError, BCAuthError, requests.RequestException):
         return False
+    return probe_contact()
 
 
 def _request_kwargs() -> dict[str, Any]:
@@ -313,26 +342,65 @@ def _name_probes(cleaned: str) -> list[str]:
     return out
 
 
-def lookup_by_name(name: str, limit: int = 5) -> list[dict[str, Any]]:
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _probe_filters(probe: str, birth_date_iso: str | None) -> list[str]:
+    """$filter expression(s) for one name probe.
+
+    Without a DOB: the plain contains() query (top-N truncation applies — fine
+    for candidate lists). With a DOB, TWO separate narrow queries:
+      1. contains(name) AND birthDate eq <dob>   — the caller's actual claim;
+         its own query so common surnames can never crowd it out of the top-N
+         (618 Müllers, and the no-DOB rows sort first by KN-number — verified
+         live 2026-07-27 that a combined same-field OR floods the pool).
+      2. contains(name) AND birthDate lt 1900-01-01 — records with NO stored
+         DOB (BC min-date 0001-01-01), so the no-DOB carve-out keeps working;
+         these still need a non-DOB factor to verify.
+    """
+    base = f"contains(name, '{_escape(probe)}')"
+    if not (birth_date_iso and _ISO_DATE_RE.match(birth_date_iso)):
+        return [base]
+    return [
+        f"{base} and birthDate eq {birth_date_iso}",
+        f"{base} and birthDate lt 1900-01-01",
+    ]
+
+
+def lookup_by_name(
+    name: str, limit: int = 5, birth_date_iso: str | None = None
+) -> list[dict[str, Any]]:
     """Find contacts by name using contains() on the `name` field.
 
     contains() is supported on a single field; only OR across distinct fields
     fails. Retry ladder: full string -> German spelling variants (ß/ss,
     umlauts; STT robustness) -> last token alone (handles "Max Mustermann"
     where only "Mustermann" is stored) -> last-token variants.
+
+    `birth_date_iso` (ISO YYYY-MM-DD, from verification.normalize_dob) narrows
+    every probe server-side to that birth date (+ no-DOB records), so the right
+    patient is in the result no matter how common the surname.
     """
     cleaned = (name or "").strip()
     if not cleaned:
         return []
 
     for probe in _name_probes(cleaned):
-        rows = _odata_get(f"contains(name, '{_escape(probe)}')", top=limit)
+        rows: list[dict[str, Any]] = []
+        seen: set[Any] = set()
+        for filt in _probe_filters(probe, birth_date_iso):
+            for row in _odata_get(filt, top=limit):
+                if row.get("no") not in seen:
+                    seen.add(row.get("no"))
+                    rows.append(row)
         if rows:
             return [_shape(r) for r in rows]
     return []
 
 
-def lookup_by_name_all(name: str, limit: int = 10) -> list[dict[str, Any]]:
+def lookup_by_name_all(
+    name: str, limit: int = 10, birth_date_iso: str | None = None
+) -> list[dict[str, Any]]:
     """Union of matches across ALL spelling probes (no first-hit shortcut).
 
     lookup_by_name stops at the first probe with rows — fine for candidate
@@ -347,11 +415,12 @@ def lookup_by_name_all(name: str, limit: int = 10) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for probe in _name_probes(cleaned):
-        for row in _odata_get(f"contains(name, '{_escape(probe)}')", top=limit):
-            shaped = _shape(row)
-            if shaped["no"] not in seen:
-                seen.add(shaped["no"])
-                out.append(shaped)
+        for filt in _probe_filters(probe, birth_date_iso):
+            for row in _odata_get(filt, top=limit):
+                shaped = _shape(row)
+                if shaped["no"] not in seen:
+                    seen.add(shaped["no"])
+                    out.append(shaped)
         if len(out) >= limit * 3:  # safety cap
             break
     return out
