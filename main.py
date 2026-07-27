@@ -26,6 +26,7 @@ from conn_business_central import (
     BCAuthError,
     BCConfigError,
     check_order_eligibility,
+    get_contact_by_customer_no,
     get_contact_by_no,
     has_recent_order,
     lookup_by_name,
@@ -169,7 +170,11 @@ class CreateRequestIn(_TemplateTolerantModel):
     date_of_birth: str | None = Field(default=None, description="Caller-SPOKEN birth date, any format")
     postal_code: str | None = Field(default=None, description="Verification factor")
     item: str | None = Field(default=None, description="SPARE_PARTS: requested item, free text")
-    quantity: int | None = Field(default=None, description="SPARE_PARTS: requested amount")
+    quantity: int | None = Field(
+        default=None,
+        description="SPARE_PARTS: requested amount (optional — if the caller "
+                    "gave none, the request is filed flagged for clarification)",
+    )
     summary: str | None = Field(default=None, description="Caller's request in agent's words")
     callback_time: str | None = Field(default=None, description="CALLBACK: preferred time, free text")
     internal: bool = Field(default=False, description="Mark the article internal (testing)")
@@ -191,10 +196,16 @@ class VerifyIn(_TemplateTolerantModel):
     """Mid-call identity verification for callers not matched by phone (§10.1):
     the agent submits what the caller SPOKE; the server checks it against BC."""
 
-    name: str = Field(..., description="Caller-spoken full name")
-    date_of_birth: str = Field(..., description="Caller-spoken birth date, any format")
+    # Nullable on purpose: the template validator maps ""/"{{var}}" to None, so
+    # a Kundennummer-only call (name unset in Fonio) must not 422 here.
+    name: str | None = Field(default=None, description="Caller-spoken full name (with date_of_birth)")
+    date_of_birth: str | None = Field(default=None, description="Caller-spoken birth date, any format")
     phone_number: str | None = Field(default=None, description="{{fromNumber}} — extra factor if it matches")
-    customer_number: str | None = Field(default=None, description="Caller-spoken Kundennummer (3rd factor)")
+    customer_number: str | None = Field(
+        default=None,
+        description="Caller-spoken Kundennummer — verifies ON ITS OWN if it "
+                    "resolves to exactly one customer record",
+    )
     postal_code: str | None = Field(default=None, description="Caller-spoken PLZ (3rd factor)")
     contact_no: str | None = Field(
         default=None,
@@ -274,7 +285,10 @@ def lookup_caller(
     return CallerOut(
         customer_found=True,
         name=contact["name"],
-        customer_number=contact.get("customer_no"),
+        # customer_number withheld since 2026-07-20: a spoken Kundennummer now
+        # verifies on its own, so the LLM must never hold the value — an echoed
+        # ring variable could otherwise verify a caller who never said it.
+        customer_number=None,
         # Deliberately withheld since the unified flow (2026-07-13): the DOB is
         # the verification secret and is checked server-side in /verify-caller —
         # if the LLM never receives it, no prompt injection can leak it.
@@ -345,10 +359,15 @@ def _resolve_and_verify(
     plus factors are always sufficient.
 
     Candidate sources: the spoken name (fast ladder, then widened spelling
-    union) and/or the KN-number (ring lookup / previous verification).
+    union), the KN-number (ring lookup / previous verification), and/or the
+    caller-spoken Kundennummer.
     Name-selected candidates need >=1 matching factor incl. DOB when on file
     (the name itself is the implicit first factor); the KN-selected contact
     gets NO name credit and needs the full >=2-factors-incl-DOB rule.
+    Kundennummer path (MED-EL policy 2026-07-20): a spoken customer number
+    that resolves to exactly ONE BC contact verifies ON ITS OWN. Safe only
+    because /lookup-caller no longer returns the customer number — the LLM
+    cannot echo it, so the value can only come from the caller.
     Exactly one survivor may remain: zero or several -> (None, []) — the
     caller-facing response must be identical either way (§10.1).
     BC transport/auth errors propagate — callers map them to HTTP codes.
@@ -397,6 +416,14 @@ def _resolve_and_verify(
         if ring_verified:  # full rule: >=2 factors, DOB gated
             survivors.append((ring_contact, matched))
 
+    # Kundennummer-alone path. A conflicting second survivor (spoken name
+    # verified one contact, Kundennummer belongs to another) still fails the
+    # exactly-one rule below — contradictory identity claims never verify.
+    if (customer_number or "").strip():
+        kn_contact = get_contact_by_customer_no(customer_number)
+        if kn_contact and kn_contact.get("no") not in {c.get("no") for c, _ in survivors}:
+            survivors.append((kn_contact, ["customer_no"]))
+
     # Factor NAMES only — never values (PII).
     log.info("identity resolve: name=%s kn=%s survivors=%d factors=%s",
              bool(name), bool(contact_no), len(survivors), [m for _, m in survivors])
@@ -415,15 +442,19 @@ def verify_caller(
     §10.1 semantics: the NAME selects candidate records (contains-match) and
     counts as the first factor; at least one more factor must match — the birth
     date whenever BC has one on file (the no-DOB carve-out mirrors
-    /create-request). Exactly ONE candidate may survive; none or several yield
-    the same opaque failure (never reveal whether a record exists, §10.1).
+    /create-request). Alternatively (policy 2026-07-20) a caller-spoken
+    Kundennummer that maps to exactly one customer record verifies on its own.
+    Exactly ONE candidate may survive; none or several yield the same opaque
+    failure (never reveal whether a record exists, §10.1).
 
     On success the response carries the §9 variables for the rest of the call
     (customer_number, permission_to_order_again, last_ordered_items, …) —
     the name-flow equivalent of what /lookup-caller loads on ring."""
     _check_auth(authorization)
     fail = VerifyOut(verified=False, message=_VERIFY_FAIL_MSG)
-    if not body.name.strip() or not body.date_of_birth.strip():
+    has_name_dob = bool((body.name or "").strip() and (body.date_of_birth or "").strip())
+    has_customer_no = bool((body.customer_number or "").strip())
+    if not has_name_dob and not has_customer_no:
         return fail
 
     try:
@@ -492,13 +523,29 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
     toward the voice agent. Check order: cheap/leak-free first, identity
     verification before anything that could reveal account state."""
     # 1. Required fields for an order. Identity may come from the KN-number
-    #    (copied from verify_caller) OR the spoken name — the server re-resolves
-    #    either way, so a lost KN never blocks a legitimate order.
-    if not ((body.contact_no or body.name) and body.date_of_birth and body.item and body.quantity is not None):
+    #    (copied from verify_caller) or the spoken name — each with birth date —
+    #    OR the spoken Kundennummer alone (policy 2026-07-20). The server
+    #    re-resolves either way, so a lost KN never blocks a legitimate order.
+    has_identity = bool(
+        ((body.contact_no or body.name) and body.date_of_birth)
+        or (body.customer_number or "").strip()
+    )
+    #    Quantity is NOT required (policy 2026-07-20): a request without a
+    #    spoken amount is still captured, flagged, and clarified by a human.
+    if not (has_identity and body.item):
+        # Name the missing pieces (presence only — factor-safe): the agent must
+        # know WHAT to ask next; a lump-sum message gets misreported as a
+        # verification failure (observed live 2026-07-20: empty quantity →
+        # agent told the caller identity checking had failed).
+        missing = []
+        if not has_identity:
+            missing.append("Name und Geburtsdatum oder die Kundennummer")
+        if not body.item:
+            missing.append("der gewünschte Artikel")
         return CreateRequestOut(
             created=False, denied=True, reason_code="INVALID_REQUEST",
-            message="Für eine Bestellung werden Name, Geburtsdatum, "
-                    "Artikel und Menge benötigt.",
+            message="Für die Bestellung fehlt noch: " + "; ".join(missing)
+                    + ". Bitte beim Anrufer erfragen und die Anfrage erneut senden.",
         )
 
     # 2. Supported-item whitelist (pure check, zero I/O).
@@ -511,8 +558,9 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
                     "eine MED-EL Fachperson erfasst werden.",
         )
 
-    # 3. Quantity cap (the max is public policy, safe to state).
-    if not 1 <= body.quantity <= SPARE_MAX_QUANTITY:
+    # 3. Quantity cap (the max is public policy, safe to state). Only enforced
+    #    when a quantity was given — a missing one is captured and flagged.
+    if body.quantity is not None and not 1 <= body.quantity <= SPARE_MAX_QUANTITY:
         return CreateRequestOut(
             created=False, denied=True, reason_code="QUANTITY_EXCEEDED",
             message=f"Diese Menge kann nicht direkt bearbeitet werden (maximal "
@@ -554,6 +602,8 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
     #    Fail-open, flagged (signed off 2026-07-13): unknown -> human verifies.
     recent = has_recent_order(contact.get("customer_no") or "")
     tags = ["fonio", "spare_parts"]
+    if body.quantity is None:
+        tags.append("quantity-missing")
     if recent is None:
         elig_label = "UNGEPRÜFT – manuelle Prüfung erforderlich"
         tags.append("eligibility-unchecked")
@@ -585,8 +635,14 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
 
     # 7. Create the request ticket. Its number is the request number (§11.4).
     item_label = _ITEM_LABELS[item_key]
+    qty_display = "?" if body.quantity is None else str(body.quantity)
+    qty_line = (
+        "NICHT ANGEGEBEN – beim Anrufer zu klären"
+        if body.quantity is None
+        else f"{body.quantity} (max {SPARE_MAX_QUANTITY})"
+    )
     ticket = _create_zammad_ticket(
-        title=f"[SPARE_PARTS] {item_label} x{body.quantity} – {contact['no']}",
+        title=f"[SPARE_PARTS] {item_label} x{qty_display} – {contact['no']}",
         body=_ticket_body(
             [
                 ("Request-Typ", "SPARE_PARTS"),
@@ -595,7 +651,7 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
                 ("BC Customer No.", contact.get("customer_no")),
                 ("Identität verifiziert", _verified_label(verified)),
                 ("Artikel", f'{item_key} ("{body.item}")'),
-                ("Menge", f"{body.quantity} (max {SPARE_MAX_QUANTITY})"),
+                ("Menge", qty_line),
                 ("Bestellberechtigung (90-Tage-Regel)", elig_label),
             ],
             body.summary,
@@ -605,18 +661,24 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
         internal=body.internal,
     )
     number, ticket_id = ticket.get("number"), ticket.get("id")
+    qty_note = (
+        "" if body.quantity is not None
+        else " Die Stückzahl wurde nicht genannt und wird von MED-EL bei der "
+             "Bearbeitung geklärt."
+    )
     if recent:
         return CreateRequestOut(
             created=True, denied=True, reason_code="NOT_ELIGIBLE",
             request_number=number, ticket_id=ticket_id,
             message="Die Bestellung kann nicht direkt abgeschlossen werden. Die "
                     "Anfrage wurde zur Prüfung durch eine MED-EL Fachperson "
-                    f"erfasst. Die Vorgangsnummer lautet {number}.",
+                    f"erfasst. Die Vorgangsnummer lautet {number}." + qty_note,
         )
     return CreateRequestOut(
         created=True, request_number=number, ticket_id=ticket_id,
         message=f"Bestellung aufgenommen. Die Vorgangsnummer lautet {number}. "
-                "Die Bestellung erfolgt vorbehaltlich Prüfung und Freigabe durch MED-EL.",
+                "Die Bestellung erfolgt vorbehaltlich Prüfung und Freigabe durch "
+                "MED-EL." + qty_note,
     )
 
 

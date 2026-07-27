@@ -369,6 +369,27 @@ def get_contact_by_no(contact_no: str) -> dict[str, Any] | None:
     return _shape(rows[0]) if rows else None
 
 
+def get_contact_by_customer_no(customer_no: str) -> dict[str, Any] | None:
+    """Fetch the contact for a caller-spoken Kundennummer (`customerNo`).
+
+    Policy (2026-07-20): a correct Kundennummer alone verifies the caller, so
+    this MUST be unambiguous — if the customer number maps to zero OR several
+    contacts (e.g. company + persons sharing one customerNo), return None and
+    let the caller-facing response stay opaque (§10.1)."""
+    cleaned = (customer_no or "").strip()
+    # Spoken numbers arrive via STT and may carry grouping separators
+    # ("41 42 028", "41-42-028"); BC stores plain digits.
+    despaced = re.sub(r"[ .\-/]", "", cleaned)
+    if despaced.isdigit():
+        cleaned = despaced
+    if not cleaned:
+        return None
+    rows = _odata_get(f"customerNo eq '{_escape(cleaned)}'", top=2)
+    if len(rows) != 1:
+        return None
+    return _shape(rows[0])
+
+
 def _to_national_digits(raw: str) -> str:
     """Reduce a phone number to its national-significant digits.
 
