@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 from dotenv import load_dotenv
 
@@ -24,17 +25,18 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from conn_business_central import (
+    ORDER_WINDOW_DAYS,
     BCAuthError,
     BCConfigError,
     check_order_eligibility,
     get_contact_by_customer_no,
     get_contact_by_no,
-    has_recent_order,
     lookup_by_name,
     lookup_by_name_all,
     lookup_by_phone,
     phone_matches,
     probe_contact,
+    recent_order_for_item,
     warmup,
 )
 from conn_zammad import (
@@ -561,6 +563,14 @@ def _verified_label(verified: bool | None) -> str:
     return "nicht geprüft" if verified is None else ("ja" if verified else "nein")
 
 
+def _de_date(iso: str | None) -> str | None:
+    """ISO date -> speakable German DD.MM.YYYY (falls back to the input)."""
+    if not iso:
+        return None
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", iso)
+    return f"{m.group(3)}.{m.group(2)}.{m.group(1)}" if m else iso
+
+
 def _ticket_body(lines: list[tuple[str, object]], summary: str | None) -> str:
     """Labeled protocol lines + free-text summary (mirrors conn_zammad._build_body)."""
     out = [f"{k}: {v}" for k, v in lines if v not in (None, "")]
@@ -661,22 +671,35 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
         )
     verified = True  # by construction of _resolve_and_verify
 
-    # 5. Eligibility re-check (90-day recency) on BC's customer number.
+    # 5. Eligibility re-check, ITEM-AWARE (policy 2026-07-27): only a prior
+    #    order of the SAME article class inside the window blocks — a repair or
+    #    other accessory must not deny batteries. The caller is verified at
+    #    this point, so naming their own order in ticket + response is fine.
     #    Fail-open, flagged (signed off 2026-07-13): unknown -> human verifies.
-    recent = has_recent_order(contact.get("customer_no") or "")
+    item_label = _ITEM_LABELS[item_key]
+    recent = recent_order_for_item(
+        contact.get("customer_no") or "", item_key, classify_item
+    )
+    blocked = recent["blocked"]
+    blocked_date = _de_date(recent["blocking_date"])
     tags = ["fonio", "spare_parts"]
     if body.quantity is None:
         tags.append("quantity-missing")
-    if recent is None:
+    if blocked is None:
         elig_label = "UNGEPRÜFT – manuelle Prüfung erforderlich"
         tags.append("eligibility-unchecked")
-    elif recent:
+    elif blocked:
         # Known-ineligible: still record the request for a human decision
         # (§11.4 script promises capture), but flagged and NOT approved.
-        elig_label = "nein – NICHT freigegeben, manuelle Prüfung erforderlich"
+        elig_label = (
+            f"nein – {item_label} bereits bestellt"
+            + (f" am {blocked_date}" if blocked_date else "")
+            + (f' ("{recent["blocking_desc"]}")' if recent["blocking_desc"] else "")
+            + ", NICHT freigegeben, manuelle Prüfung erforderlich"
+        )
         tags.append("review-needed")
     else:
-        elig_label = "ja"
+        elig_label = f"ja (keine {item_label}-Bestellung in den letzten {ORDER_WINDOW_DAYS} Tagen)"
 
     # 6. Duplicate open request? (fail-open on search errors, flagged)
     try:
@@ -697,7 +720,6 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
         )
 
     # 7. Create the request ticket. Its number is the request number (§11.4).
-    item_label = _ITEM_LABELS[item_key]
     qty_display = "?" if body.quantity is None else str(body.quantity)
     qty_line = (
         "NICHT ANGEGEBEN – beim Anrufer zu klären"
@@ -729,13 +751,21 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
         else " Die Stückzahl wurde nicht genannt und wird von MED-EL bei der "
              "Bearbeitung geklärt."
     )
-    if recent:
+    if blocked:
+        # The agent may relay the CONCRETE reason (decision 2026-07-27): the
+        # caller is verified, and "you already ordered THIS item on <date> —
+        # other accessories are still possible" prevents the misreading that
+        # the patient may order nothing at all.
+        when = f" (zuletzt am {blocked_date})" if blocked_date else ""
         return CreateRequestOut(
             created=True, denied=True, reason_code="NOT_ELIGIBLE",
             request_number=number, ticket_id=ticket_id,
-            message="Die Bestellung kann nicht direkt abgeschlossen werden. Die "
-                    "Anfrage wurde zur Prüfung durch eine MED-EL Fachperson "
-                    f"erfasst. Die Vorgangsnummer lautet {number}." + qty_note,
+            message=f"Die Bestellung kann nicht direkt freigegeben werden: "
+                    f"{item_label} wurden innerhalb der letzten "
+                    f"{ORDER_WINDOW_DAYS} Tage bereits bestellt{when}. Anderes "
+                    f"Zubehör kann weiterhin angefragt werden. Die Anfrage "
+                    f"wurde dennoch zur Prüfung durch eine MED-EL Fachperson "
+                    f"erfasst; die Vorgangsnummer lautet {number}." + qty_note,
         )
     return CreateRequestOut(
         created=True, request_number=number, ticket_id=ticket_id,

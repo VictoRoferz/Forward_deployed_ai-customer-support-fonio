@@ -560,20 +560,69 @@ def _last_invoice_items(customer_no: str) -> tuple[list[str], str | None]:
     return [i for i in items if i], posting_date
 
 
-def has_recent_order(
-    customer_no: str, window_days: int = ORDER_WINDOW_DAYS
-) -> bool | None:
-    """Recency check only (no invoice-line queries) for /create-request.
+# Header entity -> its line entity (where the actual articles live).
+SALES_DOC_LINES = {
+    "SalesInvHeader": "SalesInvLine",
+    "SalesShipHeader": "SalesShipLine",
+    "SalesHeader": "SalesLine",
+}
 
-    Best-effort like check_order_eligibility: returns True/False, or None when
-    BC errored / customer_no is empty — the caller decides how to degrade."""
+
+def recent_order_for_item(
+    customer_no: str,
+    item_key: str,
+    classify,
+    window_days: int = ORDER_WINDOW_DAYS,
+) -> dict[str, Any]:
+    """ITEM-AWARE recency check for /create-request (policy 2026-07-27): only a
+    prior order of the SAME article class blocks — a repair invoice or other
+    accessory within the window must not deny e.g. batteries.
+
+    Scans the window's sales documents and classifies each line description
+    with `classify` (verification.classify_item, injected to keep this module
+    free of app imports — same pattern as phone_matches). Real DE-TEST wording
+    verified 2026-07-27: 'Zink Luft Batterien 675 Rayovac (à 6 Stk.)' ->
+    BATTERIES; 'Mikrofonabdeckung'/'Microphone Cover left' ->
+    MICROPHONE_COVERS; 'Spulenabdeckung'/'Mikrofon Testgerät Kit'/'Coil Cover'
+    -> None (correctly non-blocking).
+
+    Returns {"blocked": bool|None, "blocking_date": str|None,
+    "blocking_desc": str|None} — blocked None means BC errored / no
+    customer_no (caller flags UNGEPRÜFT). Short-circuits on the first match;
+    typical case (no documents in window) costs the same 3 header queries as
+    the old any-document check."""
+    result: dict[str, Any] = {"blocked": None, "blocking_date": None, "blocking_desc": None}
     if not customer_no:
-        return None
+        return result
+
     cutoff = (date.today() - timedelta(days=window_days)).isoformat()
     try:
-        return _has_recent_order(customer_no, cutoff)
+        for entity, date_field in SALES_DOC_ENTITIES.items():
+            heads = _odata_get_entity(
+                entity,
+                f"sellToCustomerNo eq '{_escape(customer_no)}' and {date_field} ge {cutoff}",
+                select=f"no,{date_field}",
+                top=5,
+                orderby=f"{date_field} desc",
+            )
+            for head in heads:
+                lines = _odata_get_entity(
+                    SALES_DOC_LINES[entity],
+                    f"documentNo eq '{_escape(head.get('no') or '')}'",
+                    select="no,description",
+                    top=20,
+                )
+                for ln in lines:
+                    desc = (ln.get("description") or "").strip()
+                    if desc and classify(desc) == item_key:
+                        result["blocked"] = True
+                        result["blocking_date"] = head.get(date_field)
+                        result["blocking_desc"] = desc
+                        return result
+        result["blocked"] = False
     except (requests.RequestException, BCAuthError):
-        return None
+        result["blocked"] = None  # unknown -> caller flags for manual review
+    return result
 
 
 def check_order_eligibility(
