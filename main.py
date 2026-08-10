@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from enum import Enum
 
@@ -757,12 +758,42 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
     #    this point, so naming their own order in ticket + response is fine.
     #    Fail-open, flagged (signed off 2026-07-13): unknown -> human verifies.
     item_label = _ITEM_LABELS[item_key]
-    recent = recent_order_for_item(
-        contact.get("customer_no") or "", item_key, classify_item
-    )
+    # Steps 5 (BC item recency) and 6 (Zammad duplicate search) run
+    # CONCURRENTLY (2026-08-10): they are independent, and the sequential
+    # success path (resolve + recency + dup search + ticket create) measured
+    # 5.5 s live — the same Fonio ~5 s tool abort the verify fix escaped.
+    # Decision order is unchanged: duplicates still decide before eligibility
+    # labels and before any ticket is created.
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="order") as pool:
+        recent_future = pool.submit(
+            recent_order_for_item,
+            contact.get("customer_no") or "", item_key, classify_item,
+        )
+        # ITEM-AWARE since 2026-08-10: only an open request for the SAME
+        # article class blocks (title carries the canonical label). Before,
+        # ANY open [SPARE_PARTS] ticket blocked — a Mikrofonabdeckungen
+        # request denied a Batterien order while the spoken message claimed
+        # "zu diesem Artikel"; now check and message agree, consistent with
+        # the item-aware eligibility policy of 2026-07-27.
+        dups_future = pool.submit(
+            search_open_tickets,
+            phone_number=body.phone_number,
+            contact_no=contact.get("no"),
+            title_contains=f"[SPARE_PARTS] {item_label}",
+        )
+        recent = recent_future.result()
+        try:
+            dups = dups_future.result()
+            dup_search_failed = False
+        except ZammadError:
+            log.exception("duplicate search failed; proceeding flagged")
+            dups, dup_search_failed = [], True
+
     blocked = recent["blocked"]
     blocked_date = _de_date(recent["blocking_date"])
     tags = ["fonio", "spare_parts"]
+    if dup_search_failed:
+        tags.append("dupcheck-failed")
     if body.quantity is None:
         tags.append("quantity-missing")
     if blocked is None:
@@ -781,22 +812,7 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
     else:
         elig_label = f"ja (keine {item_label}-Bestellung in den letzten {ORDER_WINDOW_DAYS} Tagen)"
 
-    # 6. Duplicate open request? (fail-open on search errors, flagged)
-    #    ITEM-AWARE since 2026-08-10: only an open request for the SAME article
-    #    class blocks (title carries the canonical label). Before, ANY open
-    #    [SPARE_PARTS] ticket blocked — a Mikrofonabdeckungen request denied a
-    #    Batterien order while the spoken message claimed "zu diesem Artikel";
-    #    now check and message agree, consistent with the item-aware
-    #    eligibility policy of 2026-07-27.
-    try:
-        dups = search_open_tickets(
-            phone_number=body.phone_number,
-            contact_no=contact.get("no"),
-            title_contains=f"[SPARE_PARTS] {item_label}",
-        )
-    except ZammadError:
-        log.exception("duplicate search failed; proceeding flagged")
-        dups, tags = [], tags + ["dupcheck-failed"]
+    # 6. Duplicate open request? (fetched above, fail-open already applied)
     if dups:
         return CreateRequestOut(
             created=False, denied=True, reason_code="DUPLICATE_OPEN",

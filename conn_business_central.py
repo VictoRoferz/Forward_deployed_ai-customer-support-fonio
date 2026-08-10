@@ -27,6 +27,7 @@ from typing import Any
 import requests
 from requests.adapters import HTTPAdapter
 from requests.auth import HTTPBasicAuth
+from urllib3.util.retry import Retry
 
 log = logging.getLogger("fonio-bc.connector")
 
@@ -79,7 +80,20 @@ _token_lock = threading.Lock()
 # are passed per request and session state is never mutated, so sharing it
 # across worker threads is safe (urllib3's pool is thread-safe).
 _session = requests.Session()
-_adapter = HTTPAdapter(pool_connections=4, pool_maxsize=16)
+_adapter = HTTPAdapter(
+    pool_connections=4,
+    pool_maxsize=16,
+    # One transparent retry for connect/read timeouts, GETs only — every BC
+    # data query is an idempotent GET (the OAuth POST never retries here).
+    # DE-TEST shows ~1% of single queries exceeding the 4 s timeout on slow
+    # days (observed live 2026-08-10); a fresh attempt usually answers fast,
+    # so this turns sporadic 502s into slightly slower successes. Worst case
+    # per query: 2 × BC_REQUEST_TIMEOUT.
+    max_retries=Retry(
+        total=1, connect=1, read=1, status=0, backoff_factor=0,
+        allowed_methods=frozenset({"GET"}),
+    ),
+)
 _session.mount("https://", _adapter)
 _session.mount("http://", _adapter)
 
