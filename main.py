@@ -29,8 +29,9 @@ from conn_business_central import (
     BCAuthError,
     BCConfigError,
     check_order_eligibility,
-    get_contact_by_customer_no,
     get_contact_by_no,
+    get_contacts_by_customer_no,
+    lookup_by_birth_date,
     lookup_by_name,
     lookup_by_name_all,
     lookup_by_phone,
@@ -50,8 +51,10 @@ from conn_zammad import warmup as zammad_warmup
 from verification import (
     classify_item,
     first_name_matches,
+    first_name_strictly_matches,
     match_identity_factors,
     normalize_dob,
+    surname_similarity,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -84,6 +87,15 @@ ZAMMAD_URGENT_PRIORITY_ID = int(os.environ.get("ZAMMAD_URGENT_PRIORITY_ID", "3")
 # STT proves too unreliable on first names in practice (nicknames like "Sepp"
 # for Josef already fail closed and fall back to the Kundennummer path).
 STRICT_FIRSTNAME = os.environ.get("STRICT_FIRSTNAME", "1") == "1"
+
+# DOB-pool recovery for misheard surnames (Brongkoll call, 2026-07-28): when
+# the name search finds nothing, select candidates by the EXACT spoken birth
+# date instead (~2-3 people tenant-wide share any date) and require a positive
+# Vorname match plus surname similarity >= the threshold. OFF by default —
+# it shifts "name selects, DOB confirms" to "DOB selects, name confirms",
+# which needs MED-EL sign-off before going live.
+DOB_POOL_RECOVERY = os.environ.get("DOB_POOL_RECOVERY", "0") == "1"
+DOB_POOL_MIN_SURNAME_SIM = float(os.environ.get("DOB_POOL_MIN_SURNAME_SIM", "0.7"))
 
 
 def _check_auth(authorization: str | None) -> None:
@@ -388,13 +400,16 @@ def lookup_name(
 
 
 # Uniform §10.1 failure text: byte-identical for "no record", "wrong factor"
-# AND "ambiguous" (never reveal which), and it always names the Kundennummer
-# FIRST as the next step (decision 2026-07-27) — e.g. two patients sharing
-# name + Geburtsdatum can only be told apart by their Kundennummer.
+# AND "ambiguous" (never reveal which). Steers the agent to the SPELLED name
+# first (decision 2026-07-28, Brongkoll call: the name selects the record, so
+# a misheard name must be repaired before collecting more factors), then the
+# Kundennummer — e.g. two patients sharing name + Geburtsdatum can only be
+# told apart by their Kundennummer.
 _VERIFY_FAIL_MSG = (
-    "Die Identität konnte nicht sicher bestätigt werden. Bitte fragen Sie "
-    "nach der Kundennummer und versuchen Sie es damit noch einmal — "
-    "alternativ kann ein Rückrufwunsch erfasst werden."
+    "Die Identität konnte nicht sicher bestätigt werden. Bitte lassen Sie "
+    "den Namen buchstabieren und versuchen Sie es mit der buchstabierten "
+    "Schreibweise erneut — alternativ mit der Kundennummer, oder es kann "
+    "ein Rückrufwunsch erfasst werden."
 )
 
 
@@ -467,6 +482,21 @@ def _resolve_and_verify(
             log.exception("widened name search failed; keeping first-pass result")
             widened = []
         survivors = evaluate(widened)
+        evaluated_nos |= {c.get("no") for c in widened}
+
+    if DOB_POOL_RECOVERY and name and dob_iso and not survivors:
+        # Recovery for misheard surnames (flag-gated, see the constant): the
+        # exact DOB selects a tiny pool, the Vorname must POSITIVELY match and
+        # the surname must be close — then the DOB is the confirming factor.
+        # Exactly-one-survivor below still decides; failures stay opaque.
+        for c in lookup_by_birth_date(dob_iso):
+            if c.get("no") in evaluated_nos:
+                continue
+            if not first_name_strictly_matches(name, c.get("first_name")):
+                continue
+            if surname_similarity(name, c.get("surname")) < DOB_POOL_MIN_SURNAME_SIM:
+                continue
+            survivors.append((c, ["dob"]))
 
     ring_contact = get_contact_by_no(contact_no) if contact_no else None
     if ring_contact and ring_contact.get("no") not in {c.get("no") for c, _ in survivors}:
@@ -481,13 +511,35 @@ def _resolve_and_verify(
         if ring_verified:  # full rule: >=2 factors, DOB gated
             survivors.append((ring_contact, matched))
 
-    # Kundennummer-alone path. A conflicting second survivor (spoken name
-    # verified one contact, Kundennummer belongs to another) still fails the
+    # Kundennummer path. A conflicting second survivor (spoken name verified
+    # one contact, Kundennummer belongs to another) still fails the
     # exactly-one rule below — contradictory identity claims never verify.
     if (customer_number or "").strip():
-        kn_contact = get_contact_by_customer_no(customer_number)
-        if kn_contact and kn_contact.get("no") not in {c.get("no") for c, _ in survivors}:
-            survivors.append((kn_contact, ["customer_no"]))
+        kn_rows = get_contacts_by_customer_no(customer_number)
+        survivor_nos = {c.get("no") for c, _ in survivors}
+        if len(kn_rows) == 1:
+            # Unique number -> alone-verifies (policy 2026-07-20, unchanged).
+            if kn_rows[0].get("no") not in survivor_nos:
+                survivors.append((kn_rows[0], ["customer_no"]))
+        else:
+            # SHARED account (family/school/carer — e.g. 4110082 -> 4 contacts,
+            # Brongkoll call 2026-07-28): the number alone never verifies, but
+            # each contact gets the full >=2-factors-incl-DOB check, in which
+            # customer_no is one matched factor — so number + Geburtsdatum
+            # picks the right person instead of dead-ending.
+            for c in kn_rows:
+                if c.get("no") in survivor_nos:
+                    continue
+                kn_verified, matched = match_identity_factors(
+                    c,
+                    date_of_birth=date_of_birth,
+                    phone_number=phone_number,
+                    customer_number=customer_number,
+                    postal_code=postal_code,
+                    phone_matches=phone_matches,
+                )
+                if kn_verified:
+                    survivors.append((c, matched))
 
     # Factor NAMES only — never values (PII).
     log.info("identity resolve: name=%s kn=%s survivors=%d factors=%s",

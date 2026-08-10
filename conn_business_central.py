@@ -438,13 +438,14 @@ def get_contact_by_no(contact_no: str) -> dict[str, Any] | None:
     return _shape(rows[0]) if rows else None
 
 
-def get_contact_by_customer_no(customer_no: str) -> dict[str, Any] | None:
-    """Fetch the contact for a caller-spoken Kundennummer (`customerNo`).
+def get_contacts_by_customer_no(customer_no: str, top: int = 5) -> list[dict[str, Any]]:
+    """ALL contacts sharing a caller-spoken Kundennummer (`customerNo`).
 
-    Policy (2026-07-20): a correct Kundennummer alone verifies the caller, so
-    this MUST be unambiguous — if the customer number maps to zero OR several
-    contacts (e.g. company + persons sharing one customerNo), return None and
-    let the caller-facing response stay opaque (§10.1)."""
+    One customer account can carry several contacts — family members, schools,
+    carers (verified live 2026-07-28: 4110082 -> 4 contacts). The policy split
+    lives in main._resolve_and_verify: exactly one contact -> the number alone
+    verifies (2026-07-20); several -> each must pass the full factor rule, so
+    a shared number alone never verifies but DOB+Kundennummer disambiguates."""
     cleaned = (customer_no or "").strip()
     # Spoken numbers arrive via STT and may carry grouping separators
     # ("41 42 028", "41-42-028"); BC stores plain digits.
@@ -452,11 +453,26 @@ def get_contact_by_customer_no(customer_no: str) -> dict[str, Any] | None:
     if despaced.isdigit():
         cleaned = despaced
     if not cleaned:
-        return None
-    rows = _odata_get(f"customerNo eq '{_escape(cleaned)}'", top=2)
-    if len(rows) != 1:
-        return None
-    return _shape(rows[0])
+        return []
+    rows = _odata_get(f"customerNo eq '{_escape(cleaned)}'", top=top)
+    return [_shape(r) for r in rows]
+
+
+def get_contact_by_customer_no(customer_no: str) -> dict[str, Any] | None:
+    """The contact for a Kundennummer iff it is unambiguous, else None.
+    Kept for diagnostics; verification uses get_contacts_by_customer_no."""
+    rows = get_contacts_by_customer_no(customer_no, top=2)
+    return rows[0] if len(rows) == 1 else None
+
+
+def lookup_by_birth_date(birth_date_iso: str, top: int = 25) -> list[dict[str, Any]]:
+    """All contacts born on this exact date — the recovery pool for misheard
+    names (DOB_POOL_RECOVERY in main.py). Cheap: one query, and only ~2-3
+    people share any given date in this tenant (87k contacts / ~36.5k dates)."""
+    if not _ISO_DATE_RE.match(birth_date_iso or ""):
+        return []
+    rows = _odata_get(f"birthDate eq {birth_date_iso}", top=top)
+    return [_shape(r) for r in rows]
 
 
 def _to_national_digits(raw: str) -> str:

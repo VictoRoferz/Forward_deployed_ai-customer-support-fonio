@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 from datetime import date
+from difflib import SequenceMatcher
 
 # --- Date of birth -----------------------------------------------------------
 
@@ -102,6 +103,17 @@ def normalize_dob(raw: str | None) -> str | None:
 
 # --- Identity factors --------------------------------------------------------
 
+def _normalize_customer_no(value: str | None) -> str:
+    """Spoken AND stored Kundennummern may carry grouping separators
+    ("41 42 028", "41-42-028"); compare on plain digits when possible.
+    Mirrors conn_business_central.get_contacts_by_customer_no — without this,
+    a caller-spoken "411 0082" never earns the customer_no factor even though
+    the same string finds the contact in BC (latent bug, fixed 2026-07-28)."""
+    cleaned = (value or "").strip()
+    despaced = re.sub(r"[ .\-/]", "", cleaned)
+    return despaced if despaced.isdigit() else cleaned
+
+
 def match_identity_factors(
     contact: dict,
     *,
@@ -138,8 +150,8 @@ def match_identity_factors(
     if phone_number and any(phone_matches(phone_number, p) for p in stored_phones):
         matched.append("phone")
 
-    stored_cust = (contact.get("customer_no") or "").strip()
-    if stored_cust and (customer_number or "").strip() == stored_cust:
+    stored_cust = _normalize_customer_no(contact.get("customer_no"))
+    if stored_cust and _normalize_customer_no(customer_number) == stored_cust:
         matched.append("customer_no")
 
     stored_postal = re.sub(r"[\s-]", "", contact.get("postal_code") or "")
@@ -195,6 +207,38 @@ def first_name_matches(spoken_name: str | None, stored_first_name: str | None) -
     if len(spoken) < 2 or not stored:
         return True
     return any(t in stored for t in spoken)
+
+
+def first_name_strictly_matches(
+    spoken_name: str | None, stored_first_name: str | None
+) -> bool:
+    """Positive-match variant of first_name_matches for the DOB-pool recovery
+    path: 'check does not apply' counts as NO match. The recovery path already
+    tolerates a misheard surname, so the Vorname must actually confirm —
+    a Nachname-only caller or a no-firstName record cannot use recovery."""
+    spoken = _name_tokens(spoken_name)
+    stored = _name_tokens(stored_first_name)
+    return bool(spoken and stored) and any(t in stored for t in spoken)
+
+
+def surname_similarity(spoken_name: str | None, stored_surname: str | None) -> float:
+    """Similarity (0..1) between the spoken surname and the stored one, folded.
+
+    STT may split the surname ("Bronk-Koll" -> bronk, koll), so the candidates
+    compared against the stored surname are: the last token, the last two
+    tokens joined, and everything after the first token joined; the best ratio
+    wins. Live STT variants of the 2026-07-28 Brongkoll call vs 'brongkoll':
+    'brokkoli' 0.71, 'bronkholm' 0.78, 'bronk-koll' (joined) 0.89 — all clear
+    the 0.7 default threshold."""
+    spoken = _name_tokens(spoken_name)
+    stored = "".join(_name_tokens(stored_surname))
+    if not spoken or not stored:
+        return 0.0
+    candidates = {spoken[-1]}
+    if len(spoken) >= 3:  # Vorname + split surname ("jonas","bronk","koll")
+        candidates.add("".join(spoken[-2:]))
+        candidates.add("".join(spoken[1:]))
+    return max(SequenceMatcher(None, c, stored).ratio() for c in candidates)
 
 
 # --- Spare-part item whitelist (§21 compliance rule, deliberately hardcoded) --
