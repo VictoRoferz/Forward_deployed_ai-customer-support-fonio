@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 
 from dotenv import load_dotenv
 
@@ -29,11 +30,10 @@ from conn_business_central import (
     BCAuthError,
     BCConfigError,
     check_order_eligibility,
+    fetch_verify_pools,
     get_contact_by_no,
-    get_contacts_by_customer_no,
     lookup_by_birth_date,
     lookup_by_name,
-    lookup_by_name_all,
     lookup_by_phone,
     phone_matches,
     probe_contact,
@@ -96,6 +96,13 @@ STRICT_FIRSTNAME = os.environ.get("STRICT_FIRSTNAME", "1") == "1"
 # which needs MED-EL sign-off before going live.
 DOB_POOL_RECOVERY = os.environ.get("DOB_POOL_RECOVERY", "0") == "1"
 DOB_POOL_MIN_SURNAME_SIM = float(os.environ.get("DOB_POOL_MIN_SURNAME_SIM", "0.7"))
+
+# Wall-clock budget for /verify-caller (seconds). Fonio aborts a tool call at
+# ~5 s (measured on the 2026-08-04 Mettmann call); once identity is resolved,
+# a slow eligibility lookup must not push the response past that — it degrades
+# to permission=None ("unknown"), which the prompt phrases as "vorbehaltlich
+# Prüfung". Identity resolution itself is never truncated.
+BC_VERIFY_BUDGET_S = float(os.environ.get("BC_VERIFY_BUDGET_S", "3.0"))
 
 
 def _check_auth(authorization: str | None) -> None:
@@ -467,20 +474,29 @@ def _resolve_and_verify(
                 found.append((c, matched))
         return found
 
-    candidates = lookup_by_name(name, limit=10, birth_date_iso=dob_iso) if name else []
+    # ALL candidate pools arrive from one concurrent BC batch (2026-08-10 —
+    # the sequential fetches took 4-5.5 s with a Kundennummer, past Fonio's
+    # ~5 s tool abort). The decision flow below is unchanged: same pools, same
+    # rules, same §10.1 outcomes — only the fetching is batched.
+    pools = fetch_verify_pools(
+        name=name,
+        limit=10,
+        birth_date_iso=dob_iso,
+        customer_number=customer_number,
+        contact_no=contact_no,
+    )
+
+    candidates = pools["ladder"]
     survivors = evaluate(candidates)
     evaluated_nos = {c.get("no") for c in candidates}
 
     if name and not survivors:
         # Widened second pass: the fast ladder stops at the first spelling with
         # rows, which loses e.g. "Haußmann" when STT wrote "Hausmann" and
-        # literal Hausmanns exist. Merge ALL spelling variants and re-check.
-        try:
-            widened = [c for c in lookup_by_name_all(name, limit=10, birth_date_iso=dob_iso)
-                       if c.get("no") not in evaluated_nos]
-        except Exception:
-            log.exception("widened name search failed; keeping first-pass result")
-            widened = []
+        # literal Hausmanns exist. The union of ALL spelling variants was
+        # already fetched in the batch (probe failures there degrade per-probe
+        # inside fetch_verify_pools, mirroring the old tolerant re-fetch).
+        widened = [c for c in pools["union"] if c.get("no") not in evaluated_nos]
         survivors = evaluate(widened)
         evaluated_nos |= {c.get("no") for c in widened}
 
@@ -498,7 +514,7 @@ def _resolve_and_verify(
                 continue
             survivors.append((c, ["dob"]))
 
-    ring_contact = get_contact_by_no(contact_no) if contact_no else None
+    ring_contact = pools["ring"]
     if ring_contact and ring_contact.get("no") not in {c.get("no") for c, _ in survivors}:
         ring_verified, matched = match_identity_factors(
             ring_contact,
@@ -515,7 +531,7 @@ def _resolve_and_verify(
     # one contact, Kundennummer belongs to another) still fails the
     # exactly-one rule below — contradictory identity claims never verify.
     if (customer_number or "").strip():
-        kn_rows = get_contacts_by_customer_no(customer_number)
+        kn_rows = pools["kn_rows"]
         survivor_nos = {c.get("no") for c, _ in survivors}
         if len(kn_rows) == 1:
             # Unique number -> alone-verifies (policy 2026-07-20, unchanged).
@@ -574,6 +590,7 @@ def verify_caller(
     if not has_name_dob and not has_customer_no:
         return fail
 
+    started = time.monotonic()
     try:
         contact, _ = _resolve_and_verify(
             name=body.name,
@@ -593,7 +610,18 @@ def verify_caller(
 
     if not contact:
         return fail  # none matched, or ambiguous — identical response either way
-    elig = check_order_eligibility(contact.get("customer_no") or "")
+
+    elapsed = time.monotonic() - started
+    if elapsed > BC_VERIFY_BUDGET_S:
+        # Identity is decided; eligibility must not push the answer past
+        # Fonio's tool abort. Same degrade the eligibility check itself uses
+        # on BC errors — the agent treats null as "unknown".
+        log.warning("verify: %.1fs budget exceeded (%.2fs); skipping eligibility",
+                    BC_VERIFY_BUDGET_S, elapsed)
+        elig = {"permission_to_order_again": None, "last_ordered_items": "",
+                "last_order_date": None}
+    else:
+        elig = check_order_eligibility(contact.get("customer_no") or "")
     return VerifyOut(
         verified=True,
         name=contact["name"],
