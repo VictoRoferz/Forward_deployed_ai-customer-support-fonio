@@ -782,11 +782,17 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
         elig_label = f"ja (keine {item_label}-Bestellung in den letzten {ORDER_WINDOW_DAYS} Tagen)"
 
     # 6. Duplicate open request? (fail-open on search errors, flagged)
+    #    ITEM-AWARE since 2026-08-10: only an open request for the SAME article
+    #    class blocks (title carries the canonical label). Before, ANY open
+    #    [SPARE_PARTS] ticket blocked — a Mikrofonabdeckungen request denied a
+    #    Batterien order while the spoken message claimed "zu diesem Artikel";
+    #    now check and message agree, consistent with the item-aware
+    #    eligibility policy of 2026-07-27.
     try:
         dups = search_open_tickets(
             phone_number=body.phone_number,
             contact_no=contact.get("no"),
-            title_contains="[SPARE_PARTS]",
+            title_contains=f"[SPARE_PARTS] {item_label}",
         )
     except ZammadError:
         log.exception("duplicate search failed; proceeding flagged")
