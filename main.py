@@ -696,10 +696,18 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
             missing.append("Name und Geburtsdatum oder die Kundennummer")
         if not body.item:
             missing.append("der gewünschte Artikel")
+        # Observed live 2026-08-10: on a SECOND order in the same call the
+        # agent sent neither DOB nor Kundennummer (both confirmed minutes
+        # earlier), got this denial and gave up instead of re-sending. The
+        # message now explicitly steers to re-sending already-confirmed
+        # values, not to re-interrogating the caller or aborting.
         return CreateRequestOut(
             created=False, denied=True, reason_code="INVALID_REQUEST",
             message="Für die Bestellung fehlt noch: " + "; ".join(missing)
-                    + ". Bitte beim Anrufer erfragen und die Anfrage erneut senden.",
+                    + ". Bereits im Gespräch bestätigte Werte (Geburtsdatum, "
+                    "Kundennummer) einfach im nächsten Aufruf mitsenden — nur "
+                    "wirklich fehlende Angaben beim Anrufer erfragen — und die "
+                    "Anfrage erneut senden.",
         )
 
     # 2. Supported-item whitelist (pure check, zero I/O).
