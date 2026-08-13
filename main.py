@@ -26,6 +26,15 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
+from call_flows import (
+    SPARE_MAX_QUANTITY,
+    CallerOut,
+    CallLogOut,
+    _check_auth,
+    _verified_label,
+    log_call_core,
+    lookup_caller_core,
+)
 from conn_business_central import (
     ORDER_WINDOW_DAYS,
     BCAuthError,
@@ -35,7 +44,6 @@ from conn_business_central import (
     get_contact_by_no,
     lookup_by_birth_date,
     lookup_by_name,
-    lookup_by_phone,
     phone_matches,
     probe_contact,
     recent_order_for_item,
@@ -44,7 +52,6 @@ from conn_business_central import (
 from conn_zammad import (
     ZammadConfigError,
     ZammadError,
-    create_call_ticket,
     create_ticket,
     search_open_tickets,
 )
@@ -73,12 +80,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Fonio ↔ Business Central", lifespan=lifespan)
 
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
-
-# Max units per spare-part request. Echoed as {{max_quantity}} in /lookup-caller
-# and enforced server-side in /create-request (§11.2).
-SPARE_MAX_QUANTITY = int(os.environ.get("SPARE_MAX_QUANTITY", "5"))
-
 # Zammad priority for VIGILANCE / URGENT_MEDICAL tickets.
 # Confirmed live on medelde1: 1 low / 2 normal / 3 high.
 ZAMMAD_URGENT_PRIORITY_ID = int(os.environ.get("ZAMMAD_URGENT_PRIORITY_ID", "3"))
@@ -104,14 +105,6 @@ DOB_POOL_MIN_SURNAME_SIM = float(os.environ.get("DOB_POOL_MIN_SURNAME_SIM", "0.7
 # to permission=None ("unknown"), which the prompt phrases as "vorbehaltlich
 # Prüfung". Identity resolution itself is never truncated.
 BC_VERIFY_BUDGET_S = float(os.environ.get("BC_VERIFY_BUDGET_S", "3.0"))
-
-
-def _check_auth(authorization: str | None) -> None:
-    if not WEBHOOK_SECRET:
-        return
-    expected = f"Bearer {WEBHOOK_SECRET}"
-    if authorization != expected:
-        raise HTTPException(status_code=401, detail="unauthorized")
 
 
 class _TemplateTolerantModel(BaseModel):
@@ -147,35 +140,6 @@ class ContactOut(BaseModel):
     birth_date: str | None = None
     contact_no: str | None = None
     candidates: list[dict] | None = None
-
-
-class CallerOut(BaseModel):
-    """Response for /lookup-caller. Top-level keys are bound 1:1 to the Fonio
-    prompt's {{system variables}} (§9) — DO NOT rename without updating the prompt.
-
-    open_requests is always null in v1 (duplicate prevention runs server-side in
-    /create-request instead — the on-ring path has no latency budget for it).
-    authorized_contacts is always null (no BC data source; documented as unbacked).
-    emergency_number / alternative_channel are static Fonio-side variables, never
-    returned here. Extra keys (contact_no, health_insurance_no, last_order_date)
-    are for internal use / the Zammad protocol and are ignored by the prompt.
-    """
-
-    customer_found: bool
-    name: str | None = None
-    customer_number: str | None = None          # BC customerNo (for orders)
-    date_of_birth: str | None = None
-    phone_number: str | None = None             # echoed input
-    postal_code: str | None = None              # BC postCode (verification factor)
-    permission_to_order_again: bool | None = None
-    last_ordered_items: str = ""
-    open_requests: str | None = None            # always null in v1
-    authorized_contacts: str | None = None      # always null (unbacked)
-    max_quantity: int = SPARE_MAX_QUANTITY
-    # internal / protocol only:
-    contact_no: str | None = None               # BC KN-number (Zammad linkage)
-    health_insurance_no: str | None = None      # reported, not a decision
-    last_order_date: str | None = None
 
 
 class RequestType(str, Enum):
@@ -307,12 +271,6 @@ class CallLogIn(_TemplateTolerantModel):
     internal: bool | None = Field(default=False, description="Mark as TEST request (testing)")
 
 
-class CallLogOut(BaseModel):
-    created: bool
-    ticket_id: int | None = None
-    ticket_number: str | None = None
-
-
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -342,46 +300,7 @@ def lookup_caller(
     system variables in one response. The agent still verifies identity (name +
     date_of_birth) against these values before disclosing anything."""
     _check_auth(authorization)
-    try:
-        contact = lookup_by_phone(body.phone_number)
-    except BCConfigError as e:
-        raise HTTPException(status_code=500, detail=f"config: {e}") from e
-    except Exception:
-        # Graceful degrade (incl. BCAuthError): a 5xx here makes Fonio drop the
-        # webhook and start the call with NO context at all, so any BC failure
-        # (e.g. the 2026-07-27 unpublished-web-services outage) becomes an
-        # "unknown caller" instead — the agent falls back to name/Kundennummer
-        # verification, which fails loudly (502) on its own if BC is down.
-        # Detection lives in warmup()/GET /health/deep, not in dropped calls.
-        log.exception("lookup_by_phone failed; degrading to customer_found=false")
-        return CallerOut(customer_found=False, phone_number=body.phone_number)
-
-    if not contact:
-        return CallerOut(customer_found=False, phone_number=body.phone_number)
-
-    # Eligibility is best-effort (never raises) so a slow/failed sales query
-    # degrades to permission=None rather than dropping the call.
-    elig = check_order_eligibility(contact.get("customer_no") or "")
-
-    return CallerOut(
-        customer_found=True,
-        name=contact["name"],
-        # customer_number withheld since 2026-07-20: a spoken Kundennummer now
-        # verifies on its own, so the LLM must never hold the value — an echoed
-        # ring variable could otherwise verify a caller who never said it.
-        customer_number=None,
-        # Deliberately withheld since the unified flow (2026-07-13): the DOB is
-        # the verification secret and is checked server-side in /verify-caller —
-        # if the LLM never receives it, no prompt injection can leak it.
-        date_of_birth=None,
-        phone_number=body.phone_number,
-        postal_code=contact.get("postal_code"),
-        permission_to_order_again=elig["permission_to_order_again"],
-        last_ordered_items=elig["last_ordered_items"],
-        contact_no=contact["no"],
-        health_insurance_no=contact.get("health_insurance_no"),
-        last_order_date=elig["last_order_date"],
-    )
+    return lookup_caller_core(body.phone_number)
 
 
 @app.post("/lookup-by-name", response_model=ContactOut)
@@ -648,10 +567,6 @@ def verify_caller(
 # --- /create-request ---------------------------------------------------------
 
 _ITEM_LABELS = {"BATTERIES": "Batterien", "MICROPHONE_COVERS": "Mikrofonabdeckungen"}
-
-
-def _verified_label(verified: bool | None) -> str:
-    return "nicht geprüft" if verified is None else ("ja" if verified else "nein")
 
 
 def _de_date(iso: str | None) -> str | None:
@@ -985,39 +900,17 @@ def log_call(
     runs after the call — no 5000 ms budget. Not on the live-call critical path.
     """
     _check_auth(authorization)
-    # Full protocol lines (decision 2026-07-27) — the human sees the whole call
-    # in one ticket and can cross-open the request tickets by number. This is
-    # also the backstop for the accepted same-call duplicate-lag risk: if two
-    # identical requests evaded DUPLICATE_OPEN, both numbers are listed here.
-    # PII rule unchanged: no insurance number, no device serials.
-    extra = {
-        "Identität verifiziert": _verified_label(body.verified),
-        "Angelegte Vorgänge": body.request_numbers,
-        "Angefragte Artikel": body.requested_items,
-        "Bestellberechtigung (90-Tage-Regel)": {
-            "true": "ja", "false": "nein"
-        }.get((body.eligibility or "").strip().lower(), body.eligibility),
-    }
-    try:
-        ticket = create_call_ticket(
-            phone_number=body.phone_number,
-            name=body.name,
-            customer=body.customer,
-            summary=body.summary,
-            contact_no=body.contact_no,
-            bc_found=body.bc_found,
-            title=body.title,
-            extra=extra,
-            internal=bool(body.internal),
-        )
-    except ZammadConfigError as e:
-        raise HTTPException(status_code=500, detail=f"zammad config: {e}") from e
-    except ZammadError as e:
-        log.exception("create_call_ticket failed")
-        raise HTTPException(status_code=502, detail=f"zammad: {e}") from e
-
-    return CallLogOut(
-        created=True,
-        ticket_id=ticket.get("id") if ticket else None,
-        ticket_number=ticket.get("number") if ticket else None,
+    return log_call_core(
+        phone_number=body.phone_number,
+        name=body.name,
+        customer=body.customer,
+        summary=body.summary,
+        contact_no=body.contact_no,
+        bc_found=body.bc_found,
+        title=body.title,
+        verified=body.verified,
+        request_numbers=body.request_numbers,
+        requested_items=body.requested_items,
+        eligibility=body.eligibility,
+        internal=bool(body.internal),
     )
