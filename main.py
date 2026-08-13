@@ -212,7 +212,12 @@ class CreateRequestIn(_TemplateTolerantModel):
     )
     summary: str | None = Field(default=None, description="Caller's request in agent's words")
     callback_time: str | None = Field(default=None, description="CALLBACK: preferred time, free text")
-    internal: bool = Field(default=False, description="Mark the article internal (testing)")
+    # bool | None per the _TemplateTolerantModel rule (unfilled "{{var}}" -> None
+    # must not 422). True marks a TEST run: [TEST]-Titel + Tag "test" + interner
+    # Artikel, und der Duplikat-Check ignoriert [TEST]-Tickets — damit Testanrufe
+    # keine DUPLICATE_OPEN-Leichen für spätere Tests/echte Anrufer hinterlassen.
+    # In Fonio als STATISCHES Feld im Tool-Body setzen (nicht vom LLM befüllbar).
+    internal: bool | None = Field(default=False, description="Mark as TEST request (testing)")
 
 
 class CreateRequestOut(BaseModel):
@@ -294,7 +299,12 @@ class CallLogIn(_TemplateTolerantModel):
     eligibility: str | None = Field(
         default=None, description="{{permission_to_order_again}} echo (true/false)"
     )
-    internal: bool = Field(default=False, description="Mark the article internal (testing)")
+    # bool | None per the _TemplateTolerantModel rule (unfilled "{{var}}" -> None
+    # must not 422). True marks a TEST run: [TEST]-Titel + Tag "test" + interner
+    # Artikel, und der Duplikat-Check ignoriert [TEST]-Tickets — damit Testanrufe
+    # keine DUPLICATE_OPEN-Leichen für spätere Tests/echte Anrufer hinterlassen.
+    # In Fonio als STATISCHES Feld im Tool-Body setzen (nicht vom LLM befüllbar).
+    internal: bool | None = Field(default=False, description="Mark as TEST request (testing)")
 
 
 class CallLogOut(BaseModel):
@@ -799,7 +809,8 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
 
     blocked = recent["blocked"]
     blocked_date = _de_date(recent["blocking_date"])
-    tags = ["fonio", "spare_parts"]
+    is_test = bool(body.internal)
+    tags = ["fonio", "spare_parts"] + (["test"] if is_test else [])
     if dup_search_failed:
         tags.append("dupcheck-failed")
     if body.quantity is None:
@@ -837,7 +848,8 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
         else f"{body.quantity} (max {SPARE_MAX_QUANTITY})"
     )
     ticket = _create_zammad_ticket(
-        title=f"[SPARE_PARTS] {item_label} x{qty_display} – {contact['no']}",
+        title=("[TEST] " if is_test else "")
+              + f"[SPARE_PARTS] {item_label} x{qty_display} – {contact['no']}",
         body=_ticket_body(
             [
                 ("Request-Typ", "SPARE_PARTS"),
@@ -853,7 +865,7 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
         ),
         phone_number=body.phone_number,
         tags=",".join(tags),
-        internal=body.internal,
+        internal=is_test,
     )
     number, ticket_id = ticket.get("number"), ticket.get("id")
     qty_note = (
@@ -918,9 +930,10 @@ def _create_generic_request(body: CreateRequestIn) -> CreateRequestOut:
         RequestType.URGENT_MEDICAL: f"[URGENT_MEDICAL] Medizinischer Notfall-Rückruf – {who}",
     }
     urgent = body.request_type in (RequestType.VIGILANCE, RequestType.URGENT_MEDICAL)
+    is_test = bool(body.internal)
 
     ticket = _create_zammad_ticket(
-        title=titles[body.request_type],
+        title=("[TEST] " if is_test else "") + titles[body.request_type],
         body=_ticket_body(
             [
                 ("Request-Typ", rt),
@@ -933,8 +946,8 @@ def _create_generic_request(body: CreateRequestIn) -> CreateRequestOut:
         ),
         phone_number=body.phone_number,
         priority_id=ZAMMAD_URGENT_PRIORITY_ID if urgent else None,
-        tags=f"fonio,{rt.lower()}",
-        internal=body.internal,
+        tags=f"fonio,{rt.lower()}" + (",test" if is_test else ""),
+        internal=is_test,
     )
     number = ticket.get("number")
     prefix = "Das Anliegen wurde als dringend erfasst" if urgent else "Anliegen erfasst"
@@ -995,7 +1008,7 @@ def log_call(
             bc_found=body.bc_found,
             title=body.title,
             extra=extra,
-            internal=body.internal,
+            internal=bool(body.internal),
         )
     except ZammadConfigError as e:
         raise HTTPException(status_code=500, detail=f"zammad config: {e}") from e

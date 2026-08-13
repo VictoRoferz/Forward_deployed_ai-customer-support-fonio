@@ -220,6 +220,10 @@ def search_open_tickets(
     else:
         tickets = []
 
+    # [TEST]-titled tickets (created via internal=true) NEVER count as
+    # duplicates (2026-08-11): stale open test tickets kept blocking later
+    # test calls AND would block a real caller sharing the fixture record.
+    tickets = [t for t in tickets if "[TEST]" not in (t.get("title") or "")]
     if title_contains:
         tickets = [t for t in tickets if title_contains in (t.get("title") or "")]
     return tickets
@@ -278,7 +282,8 @@ def create_call_ticket(
     _require_config()
 
     payload: dict[str, Any] = {
-        "title": title or f"Anruf von {name or phone_number or 'Unbekannt'}",
+        "title": ("[TEST] " if internal else "")
+                 + (title or f"Anruf von {name or phone_number or 'Unbekannt'}"),
         "group": ZAMMAD_GROUP,
         "article": {
             "subject": "Eingehender Anruf (Fonio AI)",
