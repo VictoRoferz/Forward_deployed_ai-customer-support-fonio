@@ -148,9 +148,23 @@ def log_call_core(
     requested_items: str | None = None,
     eligibility: str | None = None,
     internal: bool = False,
+    source: str = "fonio",
+    extra_lines: dict[str, object] | None = None,
 ) -> CallLogOut:
     """Create the ONE Zammad ticket logging a finished call (after-call path,
-    no live-call latency budget)."""
+    no live-call latency budget).
+
+    `source="fonio"` keeps the historical ticket bytes exactly (no tags, the
+    default Fonio article subject); other platforms get their own article
+    subject plus a source tag so tickets stay filterable per platform.
+    `extra_lines` appends platform-specific protocol lines (e.g. the
+    ElevenLabs conversation id) after the standard ones."""
+    if source == "fonio":
+        subject, tags = None, None
+    else:
+        label = {"elevenlabs": "ElevenLabs"}.get(source, source)
+        subject = f"Eingehender Anruf ({label} AI)"
+        tags = source + (",test" if internal else "")
     # Full protocol lines (decision 2026-07-27) — the human sees the whole call
     # in one ticket and can cross-open the request tickets by number. This is
     # also the backstop for the accepted same-call duplicate-lag risk: if two
@@ -164,6 +178,8 @@ def log_call_core(
             "true": "ja", "false": "nein"
         }.get((eligibility or "").strip().lower(), eligibility),
     }
+    if extra_lines:
+        extra.update(extra_lines)
     try:
         ticket = create_call_ticket(
             phone_number=phone_number,
@@ -175,6 +191,8 @@ def log_call_core(
             title=title,
             extra=extra,
             internal=internal,
+            subject=subject,
+            tags=tags,
         )
     except ZammadConfigError as e:
         raise HTTPException(status_code=500, detail=f"zammad config: {e}") from e

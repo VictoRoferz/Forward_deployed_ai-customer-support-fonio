@@ -182,6 +182,10 @@ class CreateRequestIn(_TemplateTolerantModel):
     # keine DUPLICATE_OPEN-Leichen für spätere Tests/echte Anrufer hinterlassen.
     # In Fonio als STATISCHES Feld im Tool-Body setzen (nicht vom LLM befüllbar).
     internal: bool | None = Field(default=False, description="Mark as TEST request (testing)")
+    # Ticket-Quellplattform für Tags ("fonio"/"elevenlabs"). Wie `internal` ein
+    # STATISCHES Feld in der Tool-Konfiguration der Plattform — niemals vom LLM
+    # befüllbar; unbekannte Werte fallen auf "fonio" zurück (Whitelist).
+    source: str | None = Field(default=None, description="Ticket source platform (static tool-config field)")
 
 
 class CreateRequestOut(BaseModel):
@@ -569,6 +573,13 @@ def verify_caller(
 _ITEM_LABELS = {"BATTERIES": "Batterien", "MICROPHONE_COVERS": "Mikrofonabdeckungen"}
 
 
+def _source_tag(body: CreateRequestIn) -> str:
+    """Whitelisted source tag for request tickets. Unknown/missing values fall
+    back to "fonio", so a misconfigured (or maliciously LLM-filled) `source`
+    can never inject arbitrary Zammad tags."""
+    return body.source if body.source in ("fonio", "elevenlabs") else "fonio"
+
+
 def _de_date(iso: str | None) -> str | None:
     """ISO date -> speakable German DD.MM.YYYY (falls back to the input)."""
     if not iso:
@@ -725,7 +736,7 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
     blocked = recent["blocked"]
     blocked_date = _de_date(recent["blocking_date"])
     is_test = bool(body.internal)
-    tags = ["fonio", "spare_parts"] + (["test"] if is_test else [])
+    tags = [_source_tag(body), "spare_parts"] + (["test"] if is_test else [])
     if dup_search_failed:
         tags.append("dupcheck-failed")
     if body.quantity is None:
@@ -861,7 +872,7 @@ def _create_generic_request(body: CreateRequestIn) -> CreateRequestOut:
         ),
         phone_number=body.phone_number,
         priority_id=ZAMMAD_URGENT_PRIORITY_ID if urgent else None,
-        tags=f"fonio,{rt.lower()}" + (",test" if is_test else ""),
+        tags=f"{_source_tag(body)},{rt.lower()}" + (",test" if is_test else ""),
         internal=is_test,
     )
     number = ticket.get("number")

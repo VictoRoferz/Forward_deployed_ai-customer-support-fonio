@@ -266,6 +266,8 @@ def create_call_ticket(
     article_type: str = "phone",
     internal: bool = False,
     extra: dict[str, Any] | None = None,
+    subject: str | None = None,
+    tags: str | None = None,
 ) -> dict[str, Any]:
     """Create one Zammad ticket logging a call. Returns the created ticket JSON.
 
@@ -278,6 +280,9 @@ def create_call_ticket(
 
     `title` defaults to a caller-derived subject. `article_type` is "phone" so
     it shows as a call in Zammad's timeline; use "note" for plain logs.
+    `subject` overrides the article subject (defaults to the Fonio wording so
+    existing callers stay byte-identical); `tags` is a comma-separated string,
+    best-effort like create_ticket's.
     """
     _require_config()
 
@@ -286,7 +291,7 @@ def create_call_ticket(
                  + (title or f"Anruf von {name or phone_number or 'Unbekannt'}"),
         "group": ZAMMAD_GROUP,
         "article": {
-            "subject": "Eingehender Anruf (Fonio AI)",
+            "subject": subject or "Eingehender Anruf (Fonio AI)",
             "body": _build_body(
                 phone_number=phone_number,
                 summary=summary,
@@ -298,6 +303,8 @@ def create_call_ticket(
             "internal": internal,
         },
     }
+    if tags:
+        payload["tags"] = tags
 
     _resolve_customer(payload, customer=customer, phone_number=phone_number)
     return _request("POST", "tickets", json=payload)
