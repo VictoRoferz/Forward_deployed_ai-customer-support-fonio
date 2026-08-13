@@ -26,6 +26,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
+from adapter_elevenlabs import router as elevenlabs_router
 from call_flows import (
     SPARE_MAX_QUANTITY,
     CallerOut,
@@ -79,6 +80,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Fonio ↔ Business Central", lifespan=lifespan)
+app.include_router(elevenlabs_router)
 
 # Zammad priority for VIGILANCE / URGENT_MEDICAL tickets.
 # Confirmed live on medelde1: 1 low / 2 normal / 3 high.
