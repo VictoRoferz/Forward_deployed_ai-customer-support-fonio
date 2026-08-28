@@ -40,12 +40,13 @@ HEADERS = {"Content-Type": "application/json"}
 if WEBHOOK_SECRET:
     HEADERS["Authorization"] = f"Bearer {WEBHOOK_SECRET}"
 
-# The 11 dynamic variables the agent defines — call-init must return ALL of
+# The 13 dynamic variables the agent defines — call-init must return ALL of
 # them on EVERY response (ElevenLabs requirement), and nothing else.
 EXPECTED_VARS = {
     "customer_found", "name", "phone_number", "permission_to_order_again",
     "last_ordered_items", "last_order_date", "max_quantity", "contact_no",
     "customer_number", "verified", "last_request_number",
+    "patient_is_minor", "dob_on_file",  # 2026-08-28 (BC contact hierarchy)
 }
 
 FIXTURE_PHONE = "+4981517703147"   # KN052805 (TEST INTERN Holger Haußmann)
@@ -153,7 +154,7 @@ def main() -> int:
     check("1 call-init fixture: match + KN",
           dv.get("customer_found") is True and dv.get("contact_no") == "KN052805",
           f"vars {str(dv)[:160]}")
-    check("1 call-init fixture: all 11 vars, no leaks",
+    check("1 call-init fixture: all 13 vars, no leaks",
           set(dv) == EXPECTED_VARS and dv.get("customer_number") == "",
           f"keys {sorted(set(dv) ^ EXPECTED_VARS)}, customer_number "
           f"{dv.get('customer_number')!r}")

@@ -96,7 +96,14 @@ def _dynamic_variables(c: CallerOut) -> dict[str, object]:
         "customer_number": "",
         "verified": "",
         "last_request_number": "",
+        # 2026-08-28: same tri-state encoding as permission_to_order_again.
+        "patient_is_minor": _tri(c.patient_is_minor),
+        "dob_on_file": _tri(c.dob_on_file),
     }
+
+
+def _tri(value: bool | None) -> str:
+    return "unknown" if value is None else ("true" if value else "false")
 
 
 @router.post("/call-init")

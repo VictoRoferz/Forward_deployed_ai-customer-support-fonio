@@ -63,6 +63,16 @@ BC_POSTAL_FIELD = os.environ.get("BC_POSTAL_FIELD", "postCode").strip()
 # "Ordered recently?" window for spare-part eligibility. 3 months ≈ 90 days.
 ORDER_WINDOW_DAYS = int(os.environ.get("BC_ORDER_WINDOW_DAYS", "90"))
 
+# BC Contact hierarchy (discovered 2026-08-28, tenant-wide scan of all 69,399
+# contacts with a customerNo): MED-EL models every patient as ONE primary card
+# (`no == companyNo`) and attaches relatives, schools, clinics and old
+# addresses as sub-contacts that point to it via `companyNo` and inherit its
+# customerNo. Every one of the 47,306 Kundennummern has at most one live
+# primary — a Kundennummer therefore identifies exactly one patient, and
+# sub-contacts are relations, never identities. `archived` marks obsolete rows
+# (old addresses, merged duplicates, deceased/left patients — 20,067 rows).
+HIERARCHY_FIELDS = ["companyNo", "archived", "relativesStatus", "lastDateModified"]
+
 # Sales document entities that count as "an order", with their date field.
 # Linkage: Contact.customerNo -> sellToCustomerNo on each header (see CLAUDE.md).
 SALES_DOC_ENTITIES = {
@@ -288,6 +298,7 @@ def _select_fields() -> str:
             "eMail",
             "customerNo",         # -> sales/repair documents (order history)
             "healthInsuranceNo",  # Krankenkasse identifier (reported, not a decision)
+            *HIERARCHY_FIELDS,    # primary/sub-contact + archived (identity resolution)
             *([BC_POSTAL_FIELD] if BC_POSTAL_FIELD else []),
             *PHONE_FIELDS,
         ]
@@ -339,7 +350,27 @@ def _shape(contact: dict[str, Any]) -> dict[str, Any]:
         # All stored numbers, for identity verification (phone factor) without
         # a second BC round-trip — the fields are already in the $select.
         "phones": [contact.get(f) for f in PHONE_FIELDS if contact.get(f)],
+        # Hierarchy: the patient card is its own company (no == companyNo); a
+        # row without companyNo is standalone and counts as primary too.
+        "company_no": contact.get("companyNo") or None,
+        "is_primary": (contact.get("companyNo") or contact.get("no")) == contact.get("no"),
+        "archived": bool(contact.get("archived")),
+        "relatives_status": contact.get("relativesStatus") or None,
+        "last_modified": _clean_birth_date(contact.get("lastDateModified")),
     }
+
+
+def normalize_customer_no(value: str | None) -> str:
+    """Spoken Kundennummern arrive via STT with grouping separators
+    ("41 42 028", "41-42-028") and sometimes a letter prefix ("CC4112722",
+    seen live 2026-08-27); BC stores plain digits. Returns the digit string
+    when the remainder is all digits, else the trimmed input unchanged."""
+    cleaned = (value or "").strip()
+    despaced = re.sub(r"[ .\-/]", "", cleaned)
+    unprefixed = re.sub(r"^[A-Za-z]+", "", despaced)
+    if unprefixed.isdigit():
+        return unprefixed
+    return cleaned
 
 
 def _escape(value: str) -> str:
@@ -511,20 +542,15 @@ def get_contact_by_no(contact_no: str) -> dict[str, Any] | None:
     return _shape(rows[0]) if rows else None
 
 
-def get_contacts_by_customer_no(customer_no: str, top: int = 5) -> list[dict[str, Any]]:
+def get_contacts_by_customer_no(customer_no: str, top: int = 10) -> list[dict[str, Any]]:
     """ALL contacts sharing a caller-spoken Kundennummer (`customerNo`).
 
-    One customer account can carry several contacts — family members, schools,
-    carers (verified live 2026-07-28: 4110082 -> 4 contacts). The policy split
-    lives in main._resolve_and_verify: exactly one contact -> the number alone
-    verifies (2026-07-20); several -> each must pass the full factor rule, so
-    a shared number alone never verifies but DOB+Kundennummer disambiguates."""
-    cleaned = (customer_no or "").strip()
-    # Spoken numbers arrive via STT and may carry grouping separators
-    # ("41 42 028", "41-42-028"); BC stores plain digits.
-    despaced = re.sub(r"[ .\-/]", "", cleaned)
-    if despaced.isdigit():
-        cleaned = despaced
+    One customer account carries the patient's primary card plus sub-contacts
+    (family, schools, clinics, old addresses — 4110082 -> 4 rows, 4129272 ->
+    5). main._resolve_and_verify picks the single live primary (is_primary and
+    not archived) as the identity; `top` is sized so no account's rows are
+    truncated (max observed: 5)."""
+    cleaned = normalize_customer_no(customer_no)
     if not cleaned:
         return []
     rows = _odata_get(f"customerNo eq '{_escape(cleaned)}'", top=top)

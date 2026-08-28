@@ -61,8 +61,10 @@ from verification import (
     classify_item,
     first_name_matches,
     first_name_strictly_matches,
+    is_minor,
     match_identity_factors,
     normalize_dob,
+    same_person,
     surname_similarity,
 )
 
@@ -91,6 +93,13 @@ ZAMMAD_URGENT_PRIORITY_ID = int(os.environ.get("ZAMMAD_URGENT_PRIORITY_ID", "3")
 # STT proves too unreliable on first names in practice (nicknames like "Sepp"
 # for Josef already fail closed and fall back to the Kundennummer path).
 STRICT_FIRSTNAME = os.environ.get("STRICT_FIRSTNAME", "1") == "1"
+
+# Archived BC contacts (obsolete records: old addresses, merged duplicates,
+# deceased/left patients — 20,067 rows, 4,254 whole accounts on 2026-08-28) are
+# NOT identities: they cannot verify or order. Set to 0 if MED-EL defines
+# "archived" differently; the ring lookup, /verify-caller and /create-request
+# then treat archived rows like live ones again.
+VERIFY_EXCLUDE_ARCHIVED = os.environ.get("VERIFY_EXCLUDE_ARCHIVED", "1") == "1"
 
 # DOB-pool recovery for misheard surnames (Brongkoll call, 2026-07-28): when
 # the name search finds nothing, select candidates by the EXACT spoken birth
@@ -193,12 +202,13 @@ class CreateRequestIn(_TemplateTolerantModel):
 class CreateRequestOut(BaseModel):
     created: bool
     denied: bool = False
-    # NOT_VERIFIED | NOT_ELIGIBLE | QUANTITY_EXCEEDED | DUPLICATE_OPEN |
-    # UNSUPPORTED_ITEM | INVALID_REQUEST
+    # NOT_VERIFIED | NOT_ELIGIBLE | QUANTITY_EXCEEDED | UNSUPPORTED_ITEM |
+    # INVALID_REQUEST  (DUPLICATE_OPEN retired 2026-08-28: an open Zammad
+    # request is now only a hint line on the ticket, never a denial)
     reason_code: str | None = None
     request_number: str | None = None           # Zammad ticket number (§11.4)
     ticket_id: int | None = None
-    existing_request_number: str | None = None  # on DUPLICATE_OPEN
+    existing_request_number: str | None = None  # always null since 2026-08-28 (kept for tool-schema compat)
     message: str | None = None                  # speakable German, factor-safe
 
 
@@ -238,6 +248,12 @@ class VerifyOut(BaseModel):
     last_order_date: str | None = None
     max_quantity: int = SPARE_MAX_QUANTITY
     message: str | None = None
+    # Under 18 by BC birth date (None = no date on file). The agent confirms a
+    # parent/guardian is calling before disclosing anything (§10.2).
+    patient_is_minor: bool | None = None
+    # Same patient under further Kundennummern (BC duplicate accounts) —
+    # informational; order controls already span all of them.
+    duplicate_accounts: list[str] | None = None
 
 
 class CallLogIn(_TemplateTolerantModel):
@@ -356,6 +372,79 @@ _VERIFY_FAIL_MSG = (
 )
 
 
+def _identity_pool(pool: list[dict]) -> list[dict]:
+    """Reduce raw BC rows to rows that can BE an identity: live primary
+    contacts (see conn_business_central.HIERARCHY_FIELDS). Sub-contacts
+    (relatives, schools, clinics, old addresses) are relations of the patient,
+    never identities — a parent giving the PATIENT's data verifies as the
+    patient (policy confirmed 2026-08-28). Archived rows are obsolete records
+    and drop out unless VERIFY_EXCLUDE_ARCHIVED is switched off."""
+    out = []
+    for c in pool:
+        if VERIFY_EXCLUDE_ARCHIVED and c.get("archived"):
+            continue
+        if not c.get("is_primary"):
+            continue
+        out.append(c)
+    return out
+
+
+def _name_fits(name: str | None, contact: dict) -> bool:
+    """Does a SPOKEN name plausibly denote this contact? Used on the
+    Kundennummer path, where the name is not the selector (the number is) but
+    must not contradict the account holder. Tolerant to STT: a full name fits
+    when the surname is similar (>= DOB_POOL_MIN_SURNAME_SIM, "Brokkoli" ~
+    "Brongkoll" 0.71) and the Vorname does not contradict; a garbled surname
+    still fits if the Vorname positively matches ("Katja Wassel" -> Katja
+    Basl); a sub-contact's or stranger's name ("Weber", "Klaus-Uwe" for Jonas)
+    fits neither and fails."""
+    if not (name or "").strip():
+        return True
+    if surname_similarity(name, contact.get("surname")) >= DOB_POOL_MIN_SURNAME_SIM:
+        return (not STRICT_FIRSTNAME) or first_name_matches(name, contact.get("first_name"))
+    return first_name_strictly_matches(name, contact.get("first_name"))
+
+
+def _contradicts(contact: dict, *, dob_iso: str | None, postal_code: str | None) -> bool:
+    """A SPOKEN factor that BC can check and that does NOT match. The
+    Kundennummer path replaces a missing birth date, never a wrong one: a
+    caller who states the wrong DOB or PLZ for the account holder fails even
+    with the correct number (impostor with a parcel label, or a relative
+    giving their own data instead of the patient's)."""
+    stored_dob = contact.get("birth_date")
+    if dob_iso and stored_dob and dob_iso != stored_dob:
+        return True
+    stored_postal = re.sub(r"[\s-]", "", contact.get("postal_code") or "")
+    given_postal = re.sub(r"[\s-]", "", postal_code or "")
+    if given_postal and stored_postal and given_postal != stored_postal:
+        return True
+    return False
+
+
+def _merge_same_person(survivors: list[tuple[dict, list[str]]]) -> list[tuple[dict, list[str]]]:
+    """A patient who exists as a live primary under SEVERAL Kundennummern
+    (17 people, scan 2026-08-28) would otherwise fail as 'ambiguous'. When
+    every survivor is the same human (folded name + identical birth date),
+    keep the most recently modified card and record the other customer
+    numbers on it — /create-request checks item recency across ALL of them
+    so the duplicate account can never be used to double-order."""
+    if len(survivors) < 2:
+        return survivors
+    first = survivors[0][0]
+    if not all(same_person(first, c) for c, _ in survivors[1:]):
+        return survivors
+    ranked = sorted(survivors, key=lambda s: s[0].get("last_modified") or "", reverse=True)
+    keeper, matched = ranked[0]
+    keeper = dict(keeper)
+    keeper["duplicate_customer_nos"] = sorted(
+        {c.get("customer_no") for c, _ in ranked[1:] if c.get("customer_no")}
+        - {keeper.get("customer_no")}
+    )
+    log.info("identity resolve: merged %d same-person cards -> %s (duplicates: %s)",
+             len(survivors), keeper.get("no"), keeper["duplicate_customer_nos"])
+    return [(keeper, matched)]
+
+
 def _resolve_and_verify(
     *,
     name: str | None,
@@ -365,7 +454,8 @@ def _resolve_and_verify(
     customer_number: str | None,
     postal_code: str | None,
 ) -> tuple[dict | None, list[str]]:
-    """Locate exactly ONE BC contact that passes the §10.1 factor rules.
+    """Locate exactly ONE BC patient (live primary contact) that passes the
+    §10.1 factor rules.
 
     Shared by /verify-caller and /create-request so ordering never depends on
     the LLM correctly copying a KN-number between tool calls — the spoken name
@@ -373,16 +463,22 @@ def _resolve_and_verify(
 
     Candidate sources: the spoken name (fast ladder, then widened spelling
     union), the KN-number (ring lookup / previous verification), and/or the
-    caller-spoken Kundennummer.
+    caller-spoken Kundennummer. Every pool is first reduced to live primary
+    contacts (_identity_pool) — the BC hierarchy discovered 2026-08-28.
     Name-selected candidates need >=1 matching factor incl. DOB when on file
     (the name itself is the implicit first factor); the KN-selected contact
     gets NO name credit and needs the full >=2-factors-incl-DOB rule.
-    Kundennummer path (MED-EL policy 2026-07-20): a spoken customer number
-    that resolves to exactly ONE BC contact verifies ON ITS OWN. Safe only
-    because /lookup-caller no longer returns the customer number — the LLM
-    cannot echo it, so the value can only come from the caller.
-    Exactly one survivor may remain: zero or several -> (None, []) — the
-    caller-facing response must be identical either way (§10.1).
+    Kundennummer path (MED-EL policy 2026-07-20, extended 2026-08-28): a
+    spoken customer number resolves to its single live primary contact, which
+    verifies ON ITS OWN — provided nothing else the caller said contradicts
+    that record (first name, birth date, PLZ). Safe only because
+    /lookup-caller no longer returns the customer number — the LLM cannot echo
+    it, so the value can only come from the caller. Accounts whose primary is
+    archived (84 tenant-wide) fall back to the full factor rule on the live
+    sub-contacts.
+    Exactly one survivor may remain (same-person duplicates merged first):
+    zero or several -> (None, []) — the caller-facing response must be
+    identical either way (§10.1).
     BC transport/auth errors propagate — callers map them to HTTP codes.
     """
     # Normalized ONCE: goes into the BC $filter (so the right patient is in the
@@ -392,7 +488,7 @@ def _resolve_and_verify(
 
     def evaluate(pool: list[dict]) -> list[tuple[dict, list[str]]]:
         found = []
-        for c in pool:
+        for c in _identity_pool(pool):
             # Name-selected pools only (ring/Kundennummer paths bypass this):
             # the spoken Vorname must fit BC's stored Vornamen (§10 policy) —
             # surname+DOB alone must not verify as somebody else.
@@ -441,7 +537,7 @@ def _resolve_and_verify(
         # exact DOB selects a tiny pool, the Vorname must POSITIVELY match and
         # the surname must be close — then the DOB is the confirming factor.
         # Exactly-one-survivor below still decides; failures stay opaque.
-        for c in lookup_by_birth_date(dob_iso):
+        for c in _identity_pool(lookup_by_birth_date(dob_iso)):
             if c.get("no") in evaluated_nos:
                 continue
             if not first_name_strictly_matches(name, c.get("first_name")):
@@ -450,7 +546,9 @@ def _resolve_and_verify(
                 continue
             survivors.append((c, ["dob"]))
 
-    ring_contact = pools["ring"]
+    # Ring/previously-verified KN: must itself be an identity (live primary) —
+    # lookup_caller_core already maps a sub-contact phone hit to its patient.
+    ring_contact = next(iter(_identity_pool([pools["ring"]] if pools["ring"] else [])), None)
     if ring_contact and ring_contact.get("no") not in {c.get("no") for c, _ in survivors}:
         ring_verified, matched = match_identity_factors(
             ring_contact,
@@ -466,20 +564,51 @@ def _resolve_and_verify(
     # Kundennummer path. A conflicting second survivor (spoken name verified
     # one contact, Kundennummer belongs to another) still fails the
     # exactly-one rule below — contradictory identity claims never verify.
+    conflict = False
     if (customer_number or "").strip():
         kn_rows = pools["kn_rows"]
         survivor_nos = {c.get("no") for c, _ in survivors}
-        if len(kn_rows) == 1:
-            # Unique number -> alone-verifies (policy 2026-07-20, unchanged).
-            if kn_rows[0].get("no") not in survivor_nos:
-                survivors.append((kn_rows[0], ["customer_no"]))
+        primaries = _identity_pool(kn_rows)
+        if len(primaries) == 1:
+            # The account holder (2026-08-28: every Kundennummer has at most
+            # one live primary; sub-contacts inherit the number but are never
+            # identities). Alone-verifies (policy 2026-07-20) unless the
+            # caller ALSO said something that contradicts this record: a
+            # first name that doesn't fit (a relative naming themselves —
+            # the prompt then asks for the patient's data), a wrong birth
+            # date or PLZ. Katja Basl (KN004623 + archived clinic sub-contact)
+            # and Jonas Brongkoll (KN002616 + 3 sub-contacts) both failed here
+            # before, although their data was correct.
+            p = primaries[0]
+            dob_confirms = bool(dob_iso and p.get("birth_date") and dob_iso == p["birth_date"])
+            fits = (dob_confirms or _name_fits(name, p)) \
+                and not _contradicts(p, dob_iso=dob_iso, postal_code=postal_code)
+            if fits:
+                if p.get("no") not in survivor_nos:
+                    _, matched = match_identity_factors(
+                        p,
+                        date_of_birth=date_of_birth,
+                        phone_number=phone_number,
+                        customer_number=customer_number,
+                        postal_code=postal_code,
+                        phone_matches=phone_matches,
+                    )
+                    survivors.append((p, matched or ["customer_no"]))
+            else:
+                # The spoken Kundennummer belongs to a patient the caller's
+                # other statements don't describe (wrong DOB/PLZ, or a name
+                # that fits neither Vorname nor Nachname). Contradictory
+                # identity claims never verify — even if the spoken name+DOB
+                # alone would have (the pre-2026-08-28 conflict rule).
+                conflict = True
         else:
-            # SHARED account (family/school/carer — e.g. 4110082 -> 4 contacts,
-            # Brongkoll call 2026-07-28): the number alone never verifies, but
-            # each contact gets the full >=2-factors-incl-DOB check, in which
-            # customer_no is one matched factor — so number + Geburtsdatum
-            # picks the right person instead of dead-ending.
-            for c in kn_rows:
+            # No live primary (patient card archived, 84 accounts) or — never
+            # observed — several: the number alone never verifies, but each
+            # live row gets the full >=2-factors-incl-DOB check, in which
+            # customer_no is one matched factor (the pre-2026-08-28 behaviour
+            # for shared accounts).
+            live_rows = [c for c in kn_rows if not (VERIFY_EXCLUDE_ARCHIVED and c.get("archived"))]
+            for c in live_rows:
                 if c.get("no") in survivor_nos:
                     continue
                 kn_verified, matched = match_identity_factors(
@@ -493,11 +622,13 @@ def _resolve_and_verify(
                 if kn_verified:
                     survivors.append((c, matched))
 
+    survivors = _merge_same_person(survivors)
+
     # Factor NAMES only — never values (PII).
-    log.info("identity resolve: name=%s kn=%s survivors=%d factors=%s",
-             bool(name), bool(contact_no), len(survivors), [m for _, m in survivors])
-    if len(survivors) != 1:
-        return None, []  # none matched, or ambiguous — identical outcome (§10.1)
+    log.info("identity resolve: name=%s kn=%s survivors=%d conflict=%s factors=%s",
+             bool(name), bool(contact_no), len(survivors), conflict, [m for _, m in survivors])
+    if conflict or len(survivors) != 1:
+        return None, []  # none matched, ambiguous, or contradictory — identical outcome (§10.1)
     return survivors[0]
 
 
@@ -567,6 +698,8 @@ def verify_caller(
         last_ordered_items=elig["last_ordered_items"],
         last_order_date=elig["last_order_date"],
         message=f"Identität bestätigt: {contact['name']}.",
+        patient_is_minor=is_minor(contact.get("birth_date")),
+        duplicate_accounts=contact.get("duplicate_customer_nos") or None,
     )
 
 
@@ -704,43 +837,50 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
     #    this point, so naming their own order in ticket + response is fine.
     #    Fail-open, flagged (signed off 2026-07-13): unknown -> human verifies.
     item_label = _ITEM_LABELS[item_key]
-    # Steps 5 (BC item recency) and 6 (Zammad duplicate search) run
-    # CONCURRENTLY (2026-08-10): they are independent, and the sequential
-    # success path (resolve + recency + dup search + ticket create) measured
-    # 5.5 s live — the same Fonio ~5 s tool abort the verify fix escaped.
-    # Decision order is unchanged: duplicates still decide before eligibility
-    # labels and before any ticket is created.
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="order") as pool:
-        recent_future = pool.submit(
-            recent_order_for_item,
-            contact.get("customer_no") or "", item_key, classify_item,
-        )
-        # ITEM-AWARE since 2026-08-10: only an open request for the SAME
-        # article class blocks (title carries the canonical label). Before,
-        # ANY open [SPARE_PARTS] ticket blocked — a Mikrofonabdeckungen
-        # request denied a Batterien order while the spoken message claimed
-        # "zu diesem Artikel"; now check and message agree, consistent with
-        # the item-aware eligibility policy of 2026-07-27.
+    # Step 5 (BC item recency — the ONLY "may order" decision) and the
+    # informational Zammad open-request search run CONCURRENTLY (2026-08-10):
+    # they are independent, and the sequential success path measured 5.5 s
+    # live — the same Fonio ~5 s tool abort the verify fix escaped.
+    # A patient duplicated under several Kundennummern (merged by
+    # _resolve_and_verify) is checked across ALL accounts — otherwise the
+    # duplicate would be a way around the 90-day rule.
+    account_nos = [contact.get("customer_no") or ""] + list(contact.get("duplicate_customer_nos") or [])
+    with ThreadPoolExecutor(max_workers=1 + len(account_nos), thread_name_prefix="order") as pool:
+        recent_futures = [
+            pool.submit(recent_order_for_item, acc, item_key, classify_item)
+            for acc in account_nos
+        ]
+        # INFORMATIONAL ONLY since 2026-08-28 (decision: BC alone decides
+        # whether a patient may order; Zammad only records the call). Open
+        # requests for the same article class are listed on the new ticket
+        # for the human processing it — never a denial. (2026-07-13 →
+        # 2026-08-28 this was the DUPLICATE_OPEN control; it mostly bit on
+        # leftover test tickets.)
         dups_future = pool.submit(
             search_open_tickets,
             phone_number=body.phone_number,
             contact_no=contact.get("no"),
             title_contains=f"[SPARE_PARTS] {item_label}",
         )
-        recent = recent_future.result()
+        recents = [f.result() for f in recent_futures]
         try:
             dups = dups_future.result()
-            dup_search_failed = False
         except ZammadError:
-            log.exception("duplicate search failed; proceeding flagged")
-            dups, dup_search_failed = [], True
+            log.exception("open-request search failed; ticket filed without the hint")
+            dups = []
 
+    # Merge across accounts: any blocking order blocks; otherwise any unknown
+    # scan leaves the verdict unknown; else clear.
+    recent = next((r for r in recents if r["blocked"]), None) \
+        or next((r for r in recents if r["blocked"] is None), None) \
+        or recents[0]
     blocked = recent["blocked"]
     blocked_date = _de_date(recent["blocking_date"])
     is_test = bool(body.internal)
     tags = [_source_tag(body), "spare_parts"] + (["test"] if is_test else [])
-    if dup_search_failed:
-        tags.append("dupcheck-failed")
+    open_same_item = ", ".join(f"#{d.get('number')}" for d in dups if d.get("number"))
+    if open_same_item:
+        tags.append("review-needed")
     if body.quantity is None:
         tags.append("quantity-missing")
     if blocked is None:
@@ -759,16 +899,7 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
     else:
         elig_label = f"ja (keine {item_label}-Bestellung in den letzten {ORDER_WINDOW_DAYS} Tagen)"
 
-    # 6. Duplicate open request? (fetched above, fail-open already applied)
-    if dups:
-        return CreateRequestOut(
-            created=False, denied=True, reason_code="DUPLICATE_OPEN",
-            existing_request_number=dups[0].get("number"),
-            message="Zu diesem Artikel liegt bereits eine offene Anfrage vor. "
-                    "Es wird keine zweite Anfrage angelegt.",
-        )
-
-    # 7. Create the request ticket. Its number is the request number (§11.4).
+    # 6. Create the request ticket. Its number is the request number (§11.4).
     qty_display = "?" if body.quantity is None else str(body.quantity)
     qty_line = (
         "NICHT ANGEGEBEN – beim Anrufer zu klären"
@@ -785,9 +916,15 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
                 ("BC Contact No.", contact.get("no")),
                 ("BC Customer No.", contact.get("customer_no")),
                 ("Identität verifiziert", _verified_label(verified)),
+                ("Patient minderjährig", "ja – Anrufer als Elternteil/Betreuer behandeln"
+                 if is_minor(contact.get("birth_date")) else None),
+                ("Doppelter Kundenstamm", ", ".join(contact["duplicate_customer_nos"])
+                 + " (Bestellprüfung über alle Konten)"
+                 if contact.get("duplicate_customer_nos") else None),
                 ("Artikel", f'{item_key} ("{body.item}")'),
                 ("Menge", qty_line),
                 ("Bestellberechtigung (90-Tage-Regel)", elig_label),
+                ("Hinweis – offene Anfrage(n) zum gleichen Artikel", open_same_item or None),
             ],
             body.summary,
         ),
@@ -831,10 +968,17 @@ def _create_generic_request(body: CreateRequestIn) -> CreateRequestOut:
     others disclose nothing and order nothing). Verification runs best-effort
     only to annotate the ticket for the human agent."""
     verified: bool | None = None
+    archived_note: str | None = None
+    minor_note: str | None = None
     if body.contact_no and (body.date_of_birth or body.customer_number or body.postal_code):
         try:
             contact = get_contact_by_no(body.contact_no)
-            if contact:
+            if contact and VERIFY_EXCLUDE_ARCHIVED and contact.get("archived"):
+                # Obsolete record: not an identity, but the human should know
+                # (e.g. a relative winding down a deceased patient's account).
+                verified = False
+                archived_note = "ja – Kontakt in BC archiviert"
+            elif contact:
                 verified, _ = match_identity_factors(
                     contact,
                     date_of_birth=body.date_of_birth,
@@ -843,6 +987,8 @@ def _create_generic_request(body: CreateRequestIn) -> CreateRequestOut:
                     postal_code=body.postal_code,
                     phone_matches=phone_matches,
                 )
+                if is_minor(contact.get("birth_date")):
+                    minor_note = "ja – Anrufer als Elternteil/Betreuer behandeln"
             else:
                 verified = False
         except Exception:
@@ -868,6 +1014,8 @@ def _create_generic_request(body: CreateRequestIn) -> CreateRequestOut:
                 ("Anrufer / Caller", body.phone_number),
                 ("BC Contact No.", body.contact_no),
                 ("Identität verifiziert", _verified_label(verified)),
+                ("Kontakt archiviert", archived_note),
+                ("Patient minderjährig", minor_note),
                 ("Gewünschte Rückrufzeit", body.callback_time),
             ],
             body.summary,

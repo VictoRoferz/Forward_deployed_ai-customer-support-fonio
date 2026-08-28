@@ -44,7 +44,7 @@ Fonio). Prompt-Quelle: `prompts/elevenlabs/medel_agent_v1.md`.
 „**PROMPT — ab hier …**" pasten. Danach Eintrag im Deployment-Log
 (`prompts/PROMPTS.md`).
 
-## 3. Dynamic Variables (alle 11 definieren)
+## 3. Dynamic Variables (alle 13 definieren)
 
 | Name | Typ | Quelle |
 |---|---|---|
@@ -59,6 +59,8 @@ Fonio). Prompt-Quelle: `prompts/elevenlabs/medel_agent_v1.md`.
 | `customer_number` | string | Seed `""`; NUR verify_caller-Assignment |
 | `verified` | string | Seed `""`; Update durch Assignment |
 | `last_request_number` | string | Seed `""`; Update durch Assignment |
+| `patient_is_minor` | string (`true`/`false`/`unknown`) | call-init (seit 2026-08-28; Patient < 18 → Anrufer als Elternteil/Betreuer behandeln, §10.2) |
+| `dob_on_file` | string (`true`/`false`/`unknown`) | call-init (seit 2026-08-28; `false` → Geburtsdatum-Frage überspringen, direkt Kundennummer/PLZ) |
 
 Konvention (steht auch im Prompt): `""` = nicht vorhanden. **Bewusst NICHT
 definiert**: `date_of_birth` (Verifikationsgeheimnis, nur serverseitig),
@@ -70,7 +72,7 @@ geschlossen), `open_requests`/`authorized_contacts` (unbelegt).
 - URL: `<BASE>/elevenlabs/call-init` · Methode POST.
 - Header: `Authorization` = Workspace-Secret `Bearer <WEBHOOK_SECRET>`.
 - Antwortformat liefert der Server fertig
-  (`conversation_initiation_client_data` mit allen 11 Variablen — auch bei
+  (`conversation_initiation_client_data` mit allen 13 Variablen — auch bei
   unbekanntem Anrufer). Kein `conversation_config_override`.
 
 ## 5. Server-Tools
@@ -160,8 +162,10 @@ Vorab: `python test_elevenlabs_adapter.py` grün (simulierte Payloads) und
    „5. Juli 1985") → verified; Assignments in der Conversation sichtbar
    (⚠️-Punkt aus Schritt 5 prüfen: schlägt ZUERST ein Versuch fehl,
    darf {{contact_no}} nicht geleert werden).
-3. Kundennummer-alone (Fixture 4158636) → verified; geteilte Nummer
-   4110082 allein → opake Fehlermeldung wird gesprochen.
+3. Kundennummer-alone (Fixture 4158636) → verified; Nummer mit
+   Nebenkontakten 4110082 allein → verified als Hauptkontakt KN002616
+   (seit 2026-08-28); 4110082 + fremdes Geburtsdatum 13.05.1966 → opake
+   Fehlermeldung wird gesprochen.
 4. Ersatzteilbestellung beim Test-Agenten → Ticket `[TEST] [SPARE_PARTS]…`,
    Subject „Eingehender Anruf (ElevenLabs AI)", Vorgangsnummer wird
    Ziffer für Ziffer vorgelesen.

@@ -65,14 +65,65 @@ CASES = [
      {"name": "", "date_of_birth": "", "phone_number": "",
       "customer_number": "4158636", "postal_code": ""},
      {"verified": True, "contact_no": "KN083495"}, 2.0),
-    ("fail_shared_kn_alone", "/verify-caller",
+    # --- BC hierarchy (2026-08-28): a Kundennummer resolves to its single live
+    # primary contact; sub-contacts (relatives, schools, clinics, old
+    # addresses) are never identities; archived rows never verify.
+    ("shared_kn_alone_primary", "/verify-caller",          # was fail_shared_kn_alone
      {"name": "", "date_of_birth": "", "phone_number": "",
       "customer_number": "4110082", "postal_code": ""},
-     {"verified": False}, 2.0),
+     {"verified": True, "contact_no": "KN002616"}, 2.0),
     ("shared_kn_plus_dob", "/verify-caller",
      {"name": "", "date_of_birth": "19.08.1994", "phone_number": "",
       "customer_number": "4110082", "postal_code": ""},
      {"verified": True, "contact_no": "KN002616"}, 2.0),
+    ("shared_kn_garbled_name", "/verify-caller",           # Brongkoll 2026-07-28 replay
+     {"name": "Jonas Brokkoli", "date_of_birth": "19.08.1994", "phone_number": "",
+      "customer_number": "4110082", "postal_code": ""},
+     {"verified": True, "contact_no": "KN002616"}, 2.5),
+    ("fail_shared_kn_relatives_own_dob", "/verify-caller",  # father KN015503 (archived sub-contact)
+     {"name": "Klaus-Uwe Brongkoll", "date_of_birth": "13.05.1966", "phone_number": "",
+      "customer_number": "4110082", "postal_code": ""},
+     {"verified": False}, 2.5),
+    ("fail_shared_kn_subcontact_name", "/verify-caller",   # live sub-contact "Weber" KN015504
+     {"name": "Weber", "date_of_birth": "", "phone_number": "",
+      "customer_number": "4110082", "postal_code": ""},
+     {"verified": False}, 2.5),
+    ("fail_shared_kn_wrong_dob", "/verify-caller",
+     {"name": "", "date_of_birth": "13.05.1966", "phone_number": "",
+      "customer_number": "4110082", "postal_code": ""},
+     {"verified": False}, 2.0),
+    ("basl_kn_alone", "/verify-caller",                    # 2026-08-27 failed live call
+     {"name": "", "date_of_birth": "", "phone_number": "",
+      "customer_number": "4112722", "postal_code": ""},
+     {"verified": True, "contact_no": "KN004623"}, 2.0),
+    ("basl_name_plus_kn", "/verify-caller",
+     {"name": "Katja Basl", "date_of_birth": "", "phone_number": "",
+      "customer_number": "4112722", "postal_code": ""},
+     {"verified": True, "contact_no": "KN004623"}, 2.5),
+    ("basl_name_plus_prefixed_kn", "/verify-caller",       # STT "CC4112722"
+     {"name": "Katja Basl", "date_of_birth": "", "phone_number": "",
+      "customer_number": "CC4112722", "postal_code": ""},
+     {"verified": True, "contact_no": "KN004623"}, 2.5),
+    ("basl_garbled_surname_plus_kn", "/verify-caller",     # 16:52 live attempt: STT "Katja Wassel"
+     {"name": "Katja Wassel", "date_of_birth": "", "phone_number": "",
+      "customer_number": "CC4112722", "postal_code": ""},
+     {"verified": True, "contact_no": "KN004623"}, 2.5),
+    ("fail_basl_kn_wrong_dob", "/verify-caller",
+     {"name": "Katja Basl", "date_of_birth": "28.06.1946", "phone_number": "",
+      "customer_number": "4112722", "postal_code": ""},
+     {"verified": False}, 2.5),
+    ("fail_graesl_archived_twin_wrong_dob", "/verify-caller",  # KN013930 archived, no DOB
+     {"name": "Daniel Gräsl", "date_of_birth": "08.09.1981", "phone_number": "",
+      "customer_number": "4112681", "postal_code": ""},
+     {"verified": False}, 2.5),
+    ("graesl_correct_dob", "/verify-caller",
+     {"name": "Daniel Gräsl", "date_of_birth": "18.09.1981", "phone_number": "",
+      "customer_number": "", "postal_code": ""},
+     {"verified": True, "contact_no": "KN004591"}, 2.5),
+    ("fail_archived_account_kn", "/verify-caller",         # 4151782: every row archived
+     {"name": "", "date_of_birth": "", "phone_number": "",
+      "customer_number": "4151782", "postal_code": ""},
+     {"verified": False}, 2.0),
     ("fail_conflicting_claims", "/verify-caller",
      {"name": "Hannelore Mettmann", "date_of_birth": "05.07.1985",
       "phone_number": "", "customer_number": "4158636", "postal_code": ""},

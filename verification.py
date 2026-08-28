@@ -105,13 +105,47 @@ def normalize_dob(raw: str | None) -> str | None:
 
 def _normalize_customer_no(value: str | None) -> str:
     """Spoken AND stored Kundennummern may carry grouping separators
-    ("41 42 028", "41-42-028"); compare on plain digits when possible.
-    Mirrors conn_business_central.get_contacts_by_customer_no — without this,
-    a caller-spoken "411 0082" never earns the customer_no factor even though
-    the same string finds the contact in BC (latent bug, fixed 2026-07-28)."""
+    ("41 42 028", "41-42-028") or an STT letter prefix ("CC4112722"); compare
+    on plain digits when possible. MUST mirror
+    conn_business_central.normalize_customer_no — without this, a caller-spoken
+    "411 0082" never earns the customer_no factor even though the same string
+    finds the contact in BC (latent bug, fixed 2026-07-28)."""
     cleaned = (value or "").strip()
     despaced = re.sub(r"[ .\-/]", "", cleaned)
-    return despaced if despaced.isdigit() else cleaned
+    unprefixed = re.sub(r"^[A-Za-z]+", "", despaced)
+    return unprefixed if unprefixed.isdigit() else cleaned
+
+
+# --- Patient record helpers (pure) --------------------------------------------
+
+def is_minor(birth_date_iso: str | None, today: date | None = None) -> bool | None:
+    """Under 18 by stored birth date; None when no birth date is on file. BC's
+    own `minor` flag is false on every row in this tenant (scan 2026-08-28), so
+    the age must be derived here."""
+    if not birth_date_iso:
+        return None
+    try:
+        y, m, d = (int(p) for p in birth_date_iso[:10].split("-"))
+        born = date(y, m, d)
+    except (ValueError, AttributeError):
+        return None
+    today = today or date.today()
+    age = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+    return age < 18
+
+
+def same_person(a: dict, b: dict) -> bool:
+    """Two shaped contacts describe the same human: identical folded first
+    name + surname AND an identical, present birth date. Used to merge a
+    patient who exists under two Kundennummern (17 such people, scan
+    2026-08-28) instead of failing them as 'ambiguous'."""
+    if not (a.get("birth_date") and a.get("birth_date") == b.get("birth_date")):
+        return False
+    return (
+        _name_tokens(a.get("first_name")) == _name_tokens(b.get("first_name"))
+        and _name_tokens(a.get("surname")) == _name_tokens(b.get("surname"))
+        and bool(_name_tokens(a.get("surname")))
+    )
 
 
 def match_identity_factors(

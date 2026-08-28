@@ -26,14 +26,20 @@ from pydantic import BaseModel
 from conn_business_central import (
     BCConfigError,
     check_order_eligibility,
+    get_contact_by_no,
     lookup_by_phone,
 )
 from conn_zammad import ZammadConfigError, ZammadError, create_call_ticket
+from verification import is_minor
 
 # Same logger as main.py so extracted code logs exactly as before.
 log = logging.getLogger("fonio-bc")
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+
+# Mirrors main.VERIFY_EXCLUDE_ARCHIVED (read here too: this module must not
+# import main). Archived BC rows are obsolete records, never identities.
+VERIFY_EXCLUDE_ARCHIVED = os.environ.get("VERIFY_EXCLUDE_ARCHIVED", "1") == "1"
 
 # Max units per spare-part request. Echoed as {{max_quantity}} in /lookup-caller
 # and enforced server-side in /create-request (§11.2).
@@ -71,6 +77,13 @@ class CallerOut(BaseModel):
     open_requests: str | None = None            # always null in v1
     authorized_contacts: str | None = None      # always null (unbacked)
     max_quantity: int = SPARE_MAX_QUANTITY
+    # Under 18 by BC birth date (None = unknown/no date): the agent must confirm
+    # a parent/guardian is calling before disclosing anything (§10.2).
+    patient_is_minor: bool | None = None
+    # False lets the agent skip the birth-date question (20% of patients have
+    # none on file) and go straight to Kundennummer/PLZ. Reveals only whether
+    # a date exists, never the date — and only for a phone-matched caller.
+    dob_on_file: bool | None = None
     # internal / protocol only:
     contact_no: str | None = None               # BC KN-number (Zammad linkage)
     health_insurance_no: str | None = None      # reported, not a decision
@@ -85,6 +98,25 @@ class CallLogOut(BaseModel):
 
 def _verified_label(verified: bool | None) -> str:
     return "nicht geprüft" if verified is None else ("ja" if verified else "nein")
+
+
+def _patient_for(contact: dict) -> dict | None:
+    """Map a phone hit to the PATIENT it belongs to (BC hierarchy, 2026-08-28):
+    a number stored on a sub-contact (a parent's row, a school) identifies the
+    account's primary card, not the sub-contact — the caller then verifies with
+    the patient's data as usual. Archived rows (obsolete records) yield None,
+    so the caller is treated as unknown. One extra BC query only when the hit
+    is a sub-contact."""
+    if VERIFY_EXCLUDE_ARCHIVED and contact.get("archived"):
+        return None
+    if contact.get("is_primary"):
+        return contact
+    primary = get_contact_by_no(contact.get("company_no") or "")
+    if not primary or (VERIFY_EXCLUDE_ARCHIVED and primary.get("archived")):
+        return None
+    log.info("ring: sub-contact %s (%s) -> patient %s", contact.get("no"),
+             contact.get("relatives_status") or "no relation", primary.get("no"))
+    return primary
 
 
 def lookup_caller_core(phone_number: str | None) -> CallerOut:
@@ -106,6 +138,12 @@ def lookup_caller_core(phone_number: str | None) -> CallerOut:
         log.exception("lookup_by_phone failed; degrading to customer_found=false")
         return CallerOut(customer_found=False, phone_number=phone_number)
 
+    if contact:
+        try:
+            contact = _patient_for(contact)
+        except Exception:
+            log.exception("primary-contact resolution failed; degrading to customer_found=false")
+            contact = None
     if not contact:
         return CallerOut(customer_found=False, phone_number=phone_number)
 
@@ -128,6 +166,8 @@ def lookup_caller_core(phone_number: str | None) -> CallerOut:
         postal_code=contact.get("postal_code"),
         permission_to_order_again=elig["permission_to_order_again"],
         last_ordered_items=elig["last_ordered_items"],
+        patient_is_minor=is_minor(contact.get("birth_date")),
+        dob_on_file=bool(contact.get("birth_date")),
         contact_no=contact["no"],
         health_insurance_no=contact.get("health_insurance_no"),
         last_order_date=elig["last_order_date"],
