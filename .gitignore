@@ -21,3 +21,6 @@ env/
 
 # Claude
 CLAUDE.md
+
+# Call recordings / evaluation data (PII — never commit)
+data_evaluation_test/

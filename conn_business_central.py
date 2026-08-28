@@ -18,12 +18,16 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
 from requests.auth import HTTPBasicAuth
+from urllib3.util.retry import Retry
 
 log = logging.getLogger("fonio-bc.connector")
 
@@ -59,6 +63,16 @@ BC_POSTAL_FIELD = os.environ.get("BC_POSTAL_FIELD", "postCode").strip()
 # "Ordered recently?" window for spare-part eligibility. 3 months ≈ 90 days.
 ORDER_WINDOW_DAYS = int(os.environ.get("BC_ORDER_WINDOW_DAYS", "90"))
 
+# BC Contact hierarchy (discovered 2026-08-28, tenant-wide scan of all 69,399
+# contacts with a customerNo): MED-EL models every patient as ONE primary card
+# (`no == companyNo`) and attaches relatives, schools, clinics and old
+# addresses as sub-contacts that point to it via `companyNo` and inherit its
+# customerNo. Every one of the 47,306 Kundennummern has at most one live
+# primary — a Kundennummer therefore identifies exactly one patient, and
+# sub-contacts are relations, never identities. `archived` marks obsolete rows
+# (old addresses, merged duplicates, deceased/left patients — 20,067 rows).
+HIERARCHY_FIELDS = ["companyNo", "archived", "relativesStatus", "lastDateModified"]
+
 # Sales document entities that count as "an order", with their date field.
 # Linkage: Contact.customerNo -> sellToCustomerNo on each header (see CLAUDE.md).
 SALES_DOC_ENTITIES = {
@@ -68,6 +82,59 @@ SALES_DOC_ENTITIES = {
 }
 
 _token_cache: dict[str, Any] = {"access_token": None, "expires_at": 0.0}
+_token_lock = threading.Lock()
+
+# Pooled HTTPS session (restored 2026-08-10 — the 2026-06-24 simplification had
+# dropped the 2026-06-17 session, so every query paid a fresh TLS handshake,
+# ~0.2-0.5 s each; conn_zammad kept its own). Stateless use only: auth headers
+# are passed per request and session state is never mutated, so sharing it
+# across worker threads is safe (urllib3's pool is thread-safe).
+_session = requests.Session()
+_adapter = HTTPAdapter(
+    pool_connections=4,
+    pool_maxsize=16,
+    # One transparent retry for connect/read timeouts, GETs only — every BC
+    # data query is an idempotent GET (the OAuth POST never retries here).
+    # DE-TEST shows ~1% of single queries exceeding the 4 s timeout on slow
+    # days (observed live 2026-08-10); a fresh attempt usually answers fast,
+    # so this turns sporadic 502s into slightly slower successes. Worst case
+    # per query: 2 × BC_REQUEST_TIMEOUT.
+    max_retries=Retry(
+        total=1, connect=1, read=1, status=0, backoff_factor=0,
+        allowed_methods=frozenset({"GET"}),
+    ),
+)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
+
+# Per-query timeout. The old hardcoded 20 s made no sense on paths where Fonio
+# aborts the whole tool call at ~5 s; a stuck query must fail fast so the
+# caller can degrade. OAuth keeps its own 15 s.
+BC_REQUEST_TIMEOUT = float(os.environ.get("BC_REQUEST_TIMEOUT", "4"))
+
+# Concurrent BC fetches (verify pools, eligibility windows, phone probes).
+# 1 = kill switch: identical code paths, fully serialized.
+BC_MAX_PARALLEL = max(1, int(os.environ.get("BC_MAX_PARALLEL", "8")))
+_executor = ThreadPoolExecutor(max_workers=BC_MAX_PARALLEL, thread_name_prefix="bc")
+
+
+def _parallel(jobs: list) -> list[tuple[Any, Exception | None]]:
+    """Run zero-arg callables concurrently on the shared executor.
+
+    Returns [(result, exception)] in input order — each call site decides
+    which failures raise and which degrade, so the sequential error semantics
+    are preserved exactly. With BC_MAX_PARALLEL=1 (or a single job) everything
+    runs inline: the kill switch serializes without changing code paths."""
+    def run(job):
+        try:
+            return job(), None
+        except Exception as e:  # noqa: BLE001 — callers re-raise selectively
+            return None, e
+
+    if BC_MAX_PARALLEL == 1 or len(jobs) <= 1:
+        return [run(job) for job in jobs]
+    futures = [_executor.submit(run, job) for job in jobs]
+    return [f.result() for f in futures]
 
 
 class BCConfigError(RuntimeError):
@@ -86,23 +153,30 @@ def _get_oauth_token() -> str:
     if _token_cache["access_token"] and _token_cache["expires_at"] > now + 60:
         return _token_cache["access_token"]
 
-    url = f"https://login.microsoftonline.com/{BC_TENANT_ID}/oauth2/v2.0/token"
-    resp = requests.post(
-        url,
-        data={
-            "grant_type": "client_credentials",
-            "client_id": BC_CLIENT_ID,
-            "client_secret": BC_CLIENT_SECRET,
-            "scope": BC_OAUTH_SCOPE,
-        },
-        timeout=15,
-    )
-    if resp.status_code != 200:
-        raise BCAuthError(f"OAuth token request failed: {resp.status_code} {resp.text}")
-    payload = resp.json()
-    _token_cache["access_token"] = payload["access_token"]
-    _token_cache["expires_at"] = now + float(payload.get("expires_in", 3600))
-    return _token_cache["access_token"]
+    with _token_lock:
+        # Re-check under the lock: with concurrent fetches, another worker may
+        # have refreshed the token while this one waited (thundering herd).
+        now = time.time()
+        if _token_cache["access_token"] and _token_cache["expires_at"] > now + 60:
+            return _token_cache["access_token"]
+
+        url = f"https://login.microsoftonline.com/{BC_TENANT_ID}/oauth2/v2.0/token"
+        resp = _session.post(
+            url,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": BC_CLIENT_ID,
+                "client_secret": BC_CLIENT_SECRET,
+                "scope": BC_OAUTH_SCOPE,
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            raise BCAuthError(f"OAuth token request failed: {resp.status_code} {resp.text}")
+        payload = resp.json()
+        _token_cache["access_token"] = payload["access_token"]
+        _token_cache["expires_at"] = now + float(payload.get("expires_in", 3600))
+        return _token_cache["access_token"]
 
 
 def probe_contact() -> bool:
@@ -224,6 +298,7 @@ def _select_fields() -> str:
             "eMail",
             "customerNo",         # -> sales/repair documents (order history)
             "healthInsuranceNo",  # Krankenkasse identifier (reported, not a decision)
+            *HIERARCHY_FIELDS,    # primary/sub-contact + archived (identity resolution)
             *([BC_POSTAL_FIELD] if BC_POSTAL_FIELD else []),
             *PHONE_FIELDS,
         ]
@@ -238,7 +313,9 @@ def _odata_get(filter_expr: str, top: int = 5) -> list[dict[str, Any]]:
         "$select": _select_fields(),
         "$top": str(top),
     }
-    resp = requests.get(BC_CONTACTS_URL, params=params, timeout=20, **_request_kwargs())
+    resp = _session.get(
+        BC_CONTACTS_URL, params=params, timeout=BC_REQUEST_TIMEOUT, **_request_kwargs()
+    )
     if resp.status_code == 401:
         raise BCAuthError(f"BC rejected auth: {resp.text}")
     resp.raise_for_status()
@@ -273,7 +350,27 @@ def _shape(contact: dict[str, Any]) -> dict[str, Any]:
         # All stored numbers, for identity verification (phone factor) without
         # a second BC round-trip — the fields are already in the $select.
         "phones": [contact.get(f) for f in PHONE_FIELDS if contact.get(f)],
+        # Hierarchy: the patient card is its own company (no == companyNo); a
+        # row without companyNo is standalone and counts as primary too.
+        "company_no": contact.get("companyNo") or None,
+        "is_primary": (contact.get("companyNo") or contact.get("no")) == contact.get("no"),
+        "archived": bool(contact.get("archived")),
+        "relatives_status": contact.get("relativesStatus") or None,
+        "last_modified": _clean_birth_date(contact.get("lastDateModified")),
     }
+
+
+def normalize_customer_no(value: str | None) -> str:
+    """Spoken Kundennummern arrive via STT with grouping separators
+    ("41 42 028", "41-42-028") and sometimes a letter prefix ("CC4112722",
+    seen live 2026-08-27); BC stores plain digits. Returns the digit string
+    when the remainder is all digits, else the trimmed input unchanged."""
+    cleaned = (value or "").strip()
+    despaced = re.sub(r"[ .\-/]", "", cleaned)
+    unprefixed = re.sub(r"^[A-Za-z]+", "", despaced)
+    if unprefixed.isdigit():
+        return unprefixed
+    return cleaned
 
 
 def _escape(value: str) -> str:
@@ -283,17 +380,24 @@ def _escape(value: str) -> str:
 def lookup_by_phone(phone: str) -> dict[str, Any] | None:
     """Find a contact whose stored phone matches `phone` in any phone field.
 
-    BC's OData here rejects OR across different fields, so we query one field
-    at a time and stop at the first hit. Within a single field we OR all
-    plausible format variants so callers can pass any common format.
+    BC's OData here rejects OR across different fields, so each field gets its
+    own query; within a field all plausible format variants are OR'ed. The
+    per-field probes run CONCURRENTLY (2026-08-10 — Fonio drops the on-ring
+    webhook at 5000 ms); the winner is the first field in PHONE_FIELDS order
+    with a hit, so the result — including which probe's error surfaces — is
+    identical to the old sequential first-hit scan.
     """
     variants = phone_variants(phone)
     if not variants:
         return None
 
-    for field in PHONE_FIELDS:
-        filt = _phone_filter_for_field(field, variants)
-        rows = _odata_get(filt, top=1)
+    results = _parallel([
+        (lambda f=field: _odata_get(_phone_filter_for_field(f, variants), top=1))
+        for field in PHONE_FIELDS
+    ])
+    for rows, err in results:
+        if err is not None:
+            raise err  # sequential scan raised here before probing later fields
         if rows:
             return _shape(rows[0])
     return None
@@ -438,25 +542,134 @@ def get_contact_by_no(contact_no: str) -> dict[str, Any] | None:
     return _shape(rows[0]) if rows else None
 
 
-def get_contact_by_customer_no(customer_no: str) -> dict[str, Any] | None:
-    """Fetch the contact for a caller-spoken Kundennummer (`customerNo`).
+def get_contacts_by_customer_no(customer_no: str, top: int = 10) -> list[dict[str, Any]]:
+    """ALL contacts sharing a caller-spoken Kundennummer (`customerNo`).
 
-    Policy (2026-07-20): a correct Kundennummer alone verifies the caller, so
-    this MUST be unambiguous — if the customer number maps to zero OR several
-    contacts (e.g. company + persons sharing one customerNo), return None and
-    let the caller-facing response stay opaque (§10.1)."""
-    cleaned = (customer_no or "").strip()
-    # Spoken numbers arrive via STT and may carry grouping separators
-    # ("41 42 028", "41-42-028"); BC stores plain digits.
-    despaced = re.sub(r"[ .\-/]", "", cleaned)
-    if despaced.isdigit():
-        cleaned = despaced
+    One customer account carries the patient's primary card plus sub-contacts
+    (family, schools, clinics, old addresses — 4110082 -> 4 rows, 4129272 ->
+    5). main._resolve_and_verify picks the single live primary (is_primary and
+    not archived) as the identity; `top` is sized so no account's rows are
+    truncated (max observed: 5)."""
+    cleaned = normalize_customer_no(customer_no)
     if not cleaned:
-        return None
-    rows = _odata_get(f"customerNo eq '{_escape(cleaned)}'", top=2)
-    if len(rows) != 1:
-        return None
-    return _shape(rows[0])
+        return []
+    rows = _odata_get(f"customerNo eq '{_escape(cleaned)}'", top=top)
+    return [_shape(r) for r in rows]
+
+
+def get_contact_by_customer_no(customer_no: str) -> dict[str, Any] | None:
+    """The contact for a Kundennummer iff it is unambiguous, else None.
+    Kept for diagnostics; verification uses get_contacts_by_customer_no."""
+    rows = get_contacts_by_customer_no(customer_no, top=2)
+    return rows[0] if len(rows) == 1 else None
+
+
+def lookup_by_birth_date(birth_date_iso: str, top: int = 25) -> list[dict[str, Any]]:
+    """All contacts born on this exact date — the recovery pool for misheard
+    names (DOB_POOL_RECOVERY in main.py). Cheap: one query, and only ~2-3
+    people share any given date in this tenant (87k contacts / ~36.5k dates)."""
+    if not _ISO_DATE_RE.match(birth_date_iso or ""):
+        return []
+    rows = _odata_get(f"birthDate eq {birth_date_iso}", top=top)
+    return [_shape(r) for r in rows]
+
+
+def fetch_verify_pools(
+    name: str | None,
+    limit: int = 10,
+    birth_date_iso: str | None = None,
+    customer_number: str | None = None,
+    contact_no: str | None = None,
+) -> dict[str, Any]:
+    """Every candidate pool _resolve_and_verify needs, fetched in ONE
+    concurrent batch (2026-08-10: the sequential two-pass flow took 4-5.5 s
+    with a Kundennummer — past Fonio's ~5 s tool abort; measured on the
+    Mettmann call of 2026-08-04).
+
+    Fires the identical query set the sequential path used — every name probe
+    × filter (what lookup_by_name_all would issue), the Kundennummer query and
+    the ring-contact query — and derives without further HTTP:
+      ladder : first probe (in _name_probes order) with rows, deduped
+               ≡ lookup_by_name(name, limit, birth_date_iso)
+      union  : all probes merged, deduped by KN, limit*3 cap in probe order
+               ≡ lookup_by_name_all(name, limit, birth_date_iso)
+      kn_rows: ≡ get_contacts_by_customer_no(customer_number)
+      ring   : ≡ get_contact_by_no(contact_no)
+
+    Error semantics mirror the sequential flow: a failed query at or before
+    the ladder-deciding probe raises (pass 1 raised → verify 502); a failure
+    past that point costs only union rows and is logged (the widened pass was
+    fetch-tolerant). Kundennummer/ring errors raise, as their direct calls
+    did. Trade-off vs sequential: probes after the ladder hit are fetched even
+    when pass 1 alone decides — a few extra top-N reads, bought for one
+    round-trip of wall clock instead of up to eleven.
+    """
+    cleaned = (name or "").strip()
+    probes = _name_probes(cleaned) if cleaned else []
+    probe_of_job: list[int] = []
+    jobs: list = []
+    for i, probe in enumerate(probes):
+        for filt in _probe_filters(probe, birth_date_iso):
+            probe_of_job.append(i)
+            jobs.append(lambda f=filt: _odata_get(f, top=limit))
+
+    kn_idx = None
+    if (customer_number or "").strip():
+        kn_idx = len(jobs)
+        jobs.append(lambda: get_contacts_by_customer_no(customer_number))
+    ring_idx = None
+    if (contact_no or "").strip():
+        ring_idx = len(jobs)
+        jobs.append(lambda: get_contact_by_no(contact_no))
+
+    results = _parallel(jobs)
+
+    rows_per_probe: dict[int, list[dict[str, Any]]] = {}
+    err_per_probe: dict[int, Exception] = {}
+    for i, (rows, err) in zip(probe_of_job, results[: len(probe_of_job)]):
+        if err is not None:
+            err_per_probe.setdefault(i, err)
+        else:
+            rows_per_probe.setdefault(i, []).extend(rows)
+
+    ladder: list[dict[str, Any]] = []
+    for i in range(len(probes)):
+        if i in err_per_probe:
+            # The sequential pass 1 reached this probe before any hit — raise.
+            raise err_per_probe[i]
+        seen: set[Any] = set()
+        deduped = []
+        for row in rows_per_probe.get(i, []):
+            if row.get("no") not in seen:
+                seen.add(row.get("no"))
+                deduped.append(row)
+        if deduped:
+            ladder = [_shape(r) for r in deduped]
+            break
+
+    union: list[dict[str, Any]] = []
+    seen_union: set[Any] = set()
+    for i in range(len(probes)):
+        if i in err_per_probe:
+            log.warning("verify pools: probe %d failed (union rows lost): %s",
+                        i, err_per_probe[i])
+            continue
+        for row in rows_per_probe.get(i, []):
+            shaped = _shape(row)
+            if shaped["no"] not in seen_union:
+                seen_union.add(shaped["no"])
+                union.append(shaped)
+        if len(union) >= limit * 3:  # same safety cap as lookup_by_name_all
+            break
+
+    kn_rows, kn_err = results[kn_idx] if kn_idx is not None else ([], None)
+    if kn_err is not None:
+        raise kn_err
+    ring, ring_err = results[ring_idx] if ring_idx is not None else (None, None)
+    if ring_err is not None:
+        raise ring_err
+
+    return {"ladder": ladder, "union": union, "kn_rows": kn_rows or [], "ring": ring}
 
 
 def _to_national_digits(raw: str) -> str:
@@ -516,48 +729,13 @@ def _odata_get_entity(
     }
     if orderby:
         params["$orderby"] = orderby
-    resp = requests.get(_entity_url(entity), params=params, timeout=20, **_request_kwargs())
+    resp = _session.get(
+        _entity_url(entity), params=params, timeout=BC_REQUEST_TIMEOUT, **_request_kwargs()
+    )
     if resp.status_code == 401:
         raise BCAuthError(f"BC rejected auth: {resp.text}")
     resp.raise_for_status()
     return resp.json().get("value", [])
-
-
-def _has_recent_order(customer_no: str, cutoff: str) -> bool:
-    """True if the customer has any sales document on/after `cutoff` (ISO date)."""
-    for entity, date_field in SALES_DOC_ENTITIES.items():
-        filt = f"sellToCustomerNo eq '{_escape(customer_no)}' and {date_field} ge {cutoff}"
-        rows = _odata_get_entity(entity, filt, select=f"no,{date_field}", top=1)
-        if rows:
-            return True
-    return False
-
-
-def _last_invoice_items(customer_no: str) -> tuple[list[str], str | None]:
-    """Most recent posted invoice's line descriptions + its posting date."""
-    heads = _odata_get_entity(
-        "SalesInvHeader",
-        f"sellToCustomerNo eq '{_escape(customer_no)}'",
-        select="no,postingDate",
-        top=1,
-        orderby="postingDate desc",
-    )
-    if not heads:
-        return [], None
-    doc_no = heads[0].get("no")
-    posting_date = heads[0].get("postingDate")
-    lines = _odata_get_entity(
-        "SalesInvLine",
-        f"documentNo eq '{_escape(doc_no)}'",
-        select="documentNo,type,no,description,quantity",
-        top=20,
-    )
-    items = [
-        (ln.get("description") or ln.get("no") or "").strip()
-        for ln in lines
-        if (ln.get("description") or ln.get("no"))
-    ]
-    return [i for i in items if i], posting_date
 
 
 # Header entity -> its line entity (where the actual articles live).
@@ -588,40 +766,64 @@ def recent_order_for_item(
 
     Returns {"blocked": bool|None, "blocking_date": str|None,
     "blocking_desc": str|None} — blocked None means BC errored / no
-    customer_no (caller flags UNGEPRÜFT). Short-circuits on the first match;
-    typical case (no documents in window) costs the same 3 header queries as
-    the old any-document check."""
+    customer_no (caller flags UNGEPRÜFT).
+
+    Fetching is concurrent (2026-08-10): the 3 window scans in one batch, then
+    every needed line query in a second batch. The VERDICT is still evaluated
+    in the fixed entity order (SalesInvHeader → SalesShipHeader → SalesHeader),
+    newest document first — so the same blocking document wins as with the old
+    sequential short-circuit scan, and an errored scan degrades to None at the
+    same point of the walk it would have aborted sequentially."""
     result: dict[str, Any] = {"blocked": None, "blocking_date": None, "blocking_desc": None}
     if not customer_no:
         return result
 
     cutoff = (date.today() - timedelta(days=window_days)).isoformat()
-    try:
-        for entity, date_field in SALES_DOC_ENTITIES.items():
-            heads = _odata_get_entity(
-                entity,
-                f"sellToCustomerNo eq '{_escape(customer_no)}' and {date_field} ge {cutoff}",
-                select=f"no,{date_field}",
-                top=5,
-                orderby=f"{date_field} desc",
-            )
-            for head in heads:
-                lines = _odata_get_entity(
-                    SALES_DOC_LINES[entity],
-                    f"documentNo eq '{_escape(head.get('no') or '')}'",
-                    select="no,description",
-                    top=20,
-                )
-                for ln in lines:
-                    desc = (ln.get("description") or "").strip()
-                    if desc and classify(desc) == item_key:
-                        result["blocked"] = True
-                        result["blocking_date"] = head.get(date_field)
-                        result["blocking_desc"] = desc
-                        return result
-        result["blocked"] = False
-    except (requests.RequestException, BCAuthError):
-        result["blocked"] = None  # unknown -> caller flags for manual review
+    entities = list(SALES_DOC_ENTITIES.items())
+    scan_res = _parallel([
+        (lambda e=entity, d=date_field: _odata_get_entity(
+            e,
+            f"sellToCustomerNo eq '{_escape(customer_no)}' and {d} ge {cutoff}",
+            select=f"no,{d}",
+            top=5,
+            orderby=f"{d} desc",
+        ))
+        for entity, date_field in entities
+    ])
+    ordered: list[tuple[str, dict[str, Any]]] = []  # (entity, head) in verdict order
+    for (entity, _), (heads, err) in zip(entities, scan_res):
+        if err is None:
+            ordered.extend((entity, head) for head in heads or [])
+    lines_res = _parallel([
+        (lambda ent=entity, h=head: _odata_get_entity(
+            SALES_DOC_LINES[ent],
+            f"documentNo eq '{_escape(h.get('no') or '')}'",
+            select="no,description",
+            top=20,
+        ))
+        for entity, head in ordered
+    ])
+    for _, err in [*scan_res, *lines_res]:
+        if err is not None and not isinstance(err, (requests.RequestException, BCAuthError)):
+            raise err  # config errors etc. keep surfacing as before
+
+    pos = 0
+    for (entity, date_field), (heads, scan_err) in zip(entities, scan_res):
+        if scan_err is not None:
+            return result  # unknown from here on — same abort point as sequential
+        for head in heads or []:
+            lines, line_err = lines_res[pos]
+            pos += 1
+            if line_err is not None:
+                return result
+            for ln in lines:
+                desc = (ln.get("description") or "").strip()
+                if desc and classify(desc) == item_key:
+                    result["blocked"] = True
+                    result["blocking_date"] = head.get(date_field)
+                    result["blocking_desc"] = desc
+                    return result
+    result["blocked"] = False
     return result
 
 
@@ -635,8 +837,14 @@ def check_order_eligibility(
     Krankenkasse is NOT decided here: BC stores only the insurance number, so
     that half is reported elsewhere and a human makes the coverage call.
 
-    Best-effort: any BC error degrades to permission=None ("unknown") rather
-    than raising, so the on-ring lookup never fails the whole call over this.
+    The three window probes and the newest-invoice header run as ONE
+    concurrent batch, then the invoice lines if a header exists — 2 round
+    trips instead of 5-6 sequential (2026-08-10). Best-effort as before: BC
+    request/auth errors degrade to permission=None ("unknown") / empty items
+    rather than raising. One refinement over the sequential scan: a document
+    found in ANY window marks "recent" even if another window errored (the old
+    scan could only return None there because it aborted early — a hit is a
+    hit); config errors still raise.
     Returns: {permission_to_order_again, last_ordered_items, last_order_date}.
     """
     result: dict[str, Any] = {
@@ -648,17 +856,50 @@ def check_order_eligibility(
         return result
 
     cutoff = (date.today() - timedelta(days=window_days)).isoformat()
-    try:
-        recent = _has_recent_order(customer_no, cutoff)
-        result["permission_to_order_again"] = not recent
-    except (requests.RequestException, BCAuthError):
-        pass  # leave permission as None -> agent treats as "unknown"
+    jobs = [
+        (lambda e=entity, d=date_field: _odata_get_entity(
+            e,
+            f"sellToCustomerNo eq '{_escape(customer_no)}' and {d} ge {cutoff}",
+            select=f"no,{d}",
+            top=1,
+        ))
+        for entity, date_field in SALES_DOC_ENTITIES.items()
+    ]
+    jobs.append(lambda: _odata_get_entity(
+        "SalesInvHeader",
+        f"sellToCustomerNo eq '{_escape(customer_no)}'",
+        select="no,postingDate",
+        top=1,
+        orderby="postingDate desc",
+    ))
+    *window_res, head_res = _parallel(jobs)
+    for _, err in [*window_res, head_res]:
+        if err is not None and not isinstance(err, (requests.RequestException, BCAuthError)):
+            raise err  # config errors etc. surfaced, exactly like the old direct calls
 
-    try:
-        items, last_date = _last_invoice_items(customer_no)
-        result["last_ordered_items"] = ", ".join(items)
-        result["last_order_date"] = last_date
-    except (requests.RequestException, BCAuthError):
-        pass
+    if any(rows for rows, err in window_res if err is None):
+        result["permission_to_order_again"] = False
+    elif not any(err for _, err in window_res):
+        result["permission_to_order_again"] = True
+    # else: no hit but a window unknown -> stays None ("unknown")
+
+    heads, head_err = head_res
+    if head_err is None and heads:
+        try:
+            lines = _odata_get_entity(
+                "SalesInvLine",
+                f"documentNo eq '{_escape(heads[0].get('no') or '')}'",
+                select="documentNo,type,no,description,quantity",
+                top=20,
+            )
+            items = [
+                (ln.get("description") or ln.get("no") or "").strip()
+                for ln in lines
+                if (ln.get("description") or ln.get("no"))
+            ]
+            result["last_ordered_items"] = ", ".join(i for i in items if i)
+            result["last_order_date"] = heads[0].get("postingDate")
+        except (requests.RequestException, BCAuthError):
+            pass
 
     return result

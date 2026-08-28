@@ -220,6 +220,10 @@ def search_open_tickets(
     else:
         tickets = []
 
+    # [TEST]-titled tickets (created via internal=true) NEVER count as
+    # duplicates (2026-08-11): stale open test tickets kept blocking later
+    # test calls AND would block a real caller sharing the fixture record.
+    tickets = [t for t in tickets if "[TEST]" not in (t.get("title") or "")]
     if title_contains:
         tickets = [t for t in tickets if title_contains in (t.get("title") or "")]
     return tickets
@@ -262,6 +266,8 @@ def create_call_ticket(
     article_type: str = "phone",
     internal: bool = False,
     extra: dict[str, Any] | None = None,
+    subject: str | None = None,
+    tags: str | None = None,
 ) -> dict[str, Any]:
     """Create one Zammad ticket logging a call. Returns the created ticket JSON.
 
@@ -274,14 +280,18 @@ def create_call_ticket(
 
     `title` defaults to a caller-derived subject. `article_type` is "phone" so
     it shows as a call in Zammad's timeline; use "note" for plain logs.
+    `subject` overrides the article subject (defaults to the Fonio wording so
+    existing callers stay byte-identical); `tags` is a comma-separated string,
+    best-effort like create_ticket's.
     """
     _require_config()
 
     payload: dict[str, Any] = {
-        "title": title or f"Anruf von {name or phone_number or 'Unbekannt'}",
+        "title": ("[TEST] " if internal else "")
+                 + (title or f"Anruf von {name or phone_number or 'Unbekannt'}"),
         "group": ZAMMAD_GROUP,
         "article": {
-            "subject": "Eingehender Anruf (Fonio AI)",
+            "subject": subject or "Eingehender Anruf (Fonio AI)",
             "body": _build_body(
                 phone_number=phone_number,
                 summary=summary,
@@ -293,6 +303,8 @@ def create_call_ticket(
             "internal": internal,
         },
     }
+    if tags:
+        payload["tags"] = tags
 
     _resolve_customer(payload, customer=customer, phone_number=phone_number)
     return _request("POST", "tickets", json=payload)
